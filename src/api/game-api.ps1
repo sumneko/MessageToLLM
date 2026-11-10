@@ -620,16 +620,17 @@ function Get-LumSnapshot {
     return [pscustomobject]@{ Lum = $lum; W = $w; H = $h }
 }
 
-# 译文框 = 格子横向范围、行底边下方 15 参考像素起、高 23 参考像素
-# （4K 实测文字落在 rowBottom+35..70，即参考空间 17.5..35，这里留出上下余量）
+# 译文框 = 格子横向范围、行底边下方 16 参考像素起、高 21 参考像素
+# 4K 实测：文字落在 rowBottom+36..70，而 rowBottom+75 起是「整格宽」的分隔白线，
+# 框高必须收在 74 以内，否则分隔线会混进签名（宽 136 = 满格宽，一眼可辨）。
 function Get-TranslationSignature {
     param($Snap, $Cell, [int]$RowBottom, [int]$N, [int]$Thr)
     $api = Get-ApiInstance
     $scale = $api.Win.Height / 1080.0
     $x = [int]$Cell.X
-    $y = [int]($RowBottom + 15 * $scale)
+    $y = [int]($RowBottom + 16 * $scale)
     $w = [int]$Cell.W
-    $h = [int][Math]::Round(23 * $scale)
+    $h = [int][Math]::Round(21 * $scale)
     if ($x -lt 0) { $w += $x; $x = 0 }
     if ($y -lt 0) { $h += $y; $y = 0 }
     if ($x + $w -gt $Snap.W) { $w = $Snap.W - $x }
@@ -696,9 +697,13 @@ function Get-GameTranslationsByCrop {
 
     $out = @{}
     $unknown = New-Object System.Collections.Generic.List[string]
+    $scale = $api.Win.Height / 1080.0
+    $minInkH = 6 * $scale     # 低于这个高度的是分隔横线 / 下划线，不是字
     foreach ($k in $sigs.Keys) {
         $sig = $sigs[$k]
         if (-not $sig) { $out[$k] = ''; continue }
+        $m = $meta[$k]
+        if ($m.InkH -gt 0 -and $m.InkH -lt $minInkH) { $out[$k] = ''; continue }
         if ($tpl.Placeholder -and ([MtGV8.TransBox]::Dist($sig, $tpl.Placeholder) -le $Tol)) { $out[$k] = ''; continue }
         $hit = ''
         $bestD = 1.0
