@@ -257,6 +257,14 @@ function Get-GameObservation {
             }
             $rowIdx = 0
             if ($inside.Count -gt 0) { $rowIdx = $inside[0].Row }
+            else {
+                # 空槽：按 y 找同块内最近的一行
+                $bestD = [double]::MaxValue
+                foreach ($cc in $grids[$hostBlk.BlockId].Cells) {
+                    $d = [Math]::Abs(($cc.Y + $cc.H / 2.0) - $cy)
+                    if ($d -lt $bestD) { $bestD = $d; $rowIdx = $cc.Row }
+                }
+            }
             $colIdx = 0
             $gCellW = [Math]::Max(1, [int][Math]::Round(80 * $scale))
             $colIdx = [int][Math]::Floor($cx / $gCellW) - [int][Math]::Floor($hostBlk.X / $gCellW) + 1

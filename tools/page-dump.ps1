@@ -75,10 +75,14 @@ foreach ($b in $obs.Blocks) {
     foreach ($r in $rows) {
         $tokens = foreach ($c in ($r.Group | Sort-Object Col)) {
             $tone = $(if ($c.Tone -eq 'gray') { '`' } else { '' })
-            if ($trans.ContainsKey($c.SymbolId)) {
+            if ($unknownSet.ContainsKey($c.SymbolId)) {
+                # 游戏里有内容，但裁剪比对认不出（多字符/新字）——台账有值就标 ~ 表示未核验
+                if ($trans.ContainsKey($c.SymbolId) -and $trans[$c.SymbolId]) { "$($c.SymbolId)[$($trans[$c.SymbolId])~]$tone" }
+                else { "$($c.SymbolId)[未知]$tone" }
+            }
+            elseif ($trans.ContainsKey($c.SymbolId)) {
                 if ($trans[$c.SymbolId]) { "$($c.SymbolId)[$($trans[$c.SymbolId])]$tone" } else { "$($c.SymbolId)[空]$tone" }
             }
-            elseif ($unknownSet.ContainsKey($c.SymbolId)) { "$($c.SymbolId)[未知]$tone" }
             else { "$($c.SymbolId)[?]$tone" }
         }
         $lines.Add(("r{0}: {1}" -f $r.Name, ($tokens -join ' ')))

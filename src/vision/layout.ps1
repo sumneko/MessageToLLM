@@ -120,7 +120,7 @@ function Get-SlotFrames {
     $maxThick = [Math]::Max(3, [int][Math]::Round($MaxThickBase * $Scale))
     $tol = [Math]::Max(2, [int][Math]::Round($TolBase * $Scale))
 
-    $raw = [MtGV5.QuickOps]::FindFrames($LumBuf.Lum, $LumBuf.Width, $LumBuf.Height, $InkThreshold, $minLen, $maxThick, $tol)
+    $raw = [MtGV9.SlotFrames]::Find($LumBuf.Lum, $LumBuf.Width, $LumBuf.Height, $InkThreshold, $minLen, $maxThick, $tol)
     $out = New-Object System.Collections.Generic.List[object]
     for ($i = 0; $i -lt $raw.Length; $i += 4) {
         $out.Add([pscustomobject]@{
@@ -129,7 +129,23 @@ function Get-SlotFrames {
                 H  = $raw[$i + 3] - $raw[$i + 1] + 1
             })
     }
-    return $out
+
+    # 去重：上下横线连成一条时会把相邻两个框误检成一个大框，
+    # 凡是被别的框完全包含的，只保留面积更小的那个。
+    $kept = New-Object System.Collections.Generic.List[object]
+    for ($i = 0; $i -lt $out.Count; $i++) {
+        $a = $out[$i]
+        $drop = $false
+        for ($j = 0; $j -lt $out.Count; $j++) {
+            if ($i -eq $j) { continue }
+            $b = $out[$j]
+            if ($a.X0 -le $b.X0 -and $a.X1 -ge $b.X1 -and $a.Y0 -le $b.Y0 -and $a.Y1 -ge $b.Y1) {
+                if (($a.W * $a.H) -gt ($b.W * $b.H)) { $drop = $true; break }
+            }
+        }
+        if (-not $drop) { $kept.Add($a) }
+    }
+    return $kept
 }
 
 # 把框的四条边抹成背景（保留框内内容）。

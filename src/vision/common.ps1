@@ -109,6 +109,114 @@ namespace MtGV8 {
 '@
 }
 
+if (-not ([System.Management.Automation.PSTypeName]'MtGV9.SlotFrames').Type) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+namespace MtGV9 {
+    public class SlotFrames {
+        // 线段带：horizontal=true 返回 [y0,y1,x0,x1]，否则 [x0,x1,y0,y1]
+        static List<int[]> FindBands(byte[] lum, int w, int h, int threshold, int minLen,
+                                    bool horizontal, int maxThick, int tol) {
+            List<int[]> runs = new List<int[]>();
+            if (horizontal) {
+                for (int y = 0; y < h; y++) {
+                    int x = 0;
+                    while (x < w) {
+                        if (lum[y * w + x] >= threshold) {
+                            int s = x;
+                            while (x < w && lum[y * w + x] >= threshold) { x++; }
+                            if (x - s >= minLen) { runs.Add(new int[] { y, s, x - 1 }); }
+                        }
+                        else { x++; }
+                    }
+                }
+            }
+            else {
+                for (int x = 0; x < w; x++) {
+                    int y = 0;
+                    while (y < h) {
+                        if (lum[y * w + x] >= threshold) {
+                            int s = y;
+                            while (y < h && lum[y * w + x] >= threshold) { y++; }
+                            if (y - s >= minLen) { runs.Add(new int[] { x, s, y - 1 }); }
+                        }
+                        else { y++; }
+                    }
+                }
+            }
+
+            List<int[]> bands = new List<int[]>();
+            runs.Sort(delegate (int[] p, int[] q) {
+                if (p[0] != q[0]) { return p[0].CompareTo(q[0]); }
+                return p[1].CompareTo(q[1]);
+            });
+            foreach (int[] r in runs) {
+                bool merged = false;
+                for (int i = bands.Count - 1; i >= 0; i--) {
+                    int[] b = bands[i];
+                    if (r[0] - b[1] > 2) { continue; }
+                    if (Math.Abs(b[2] - r[1]) <= tol && Math.Abs(b[3] - r[2]) <= tol) {
+                        b[1] = Math.Max(b[1], r[0]);
+                        merged = true;
+                        break;
+                    }
+                }
+                if (!merged) { bands.Add(new int[] { r[0], r[0], r[1], r[2] }); }
+            }
+
+            List<int[]> keeper = new List<int[]>();
+            foreach (int[] b in bands) {
+                if (b[1] - b[0] + 1 <= maxThick) { keeper.Add(b); }
+            }
+            return keeper;
+        }
+
+        // 槽位框：以「左右两条竖线」为锚，上下横线只要求覆盖该 x 区间。
+        // 这样即便上边框和别的线连成一条（长度不一致）也能识别。
+        // 返回去重后的 [x0,y0,x1,y1] 四元组。
+        public static int[] Find(byte[] lum, int w, int h, int threshold, int minLen, int maxThick, int tol) {
+            List<int[]> hBands = FindBands(lum, w, h, threshold, minLen, true, maxThick, tol);
+            List<int[]> vBands = FindBands(lum, w, h, threshold, minLen, false, maxThick, tol);
+            List<int> outv = new List<int>();
+            HashSet<string> seen = new HashSet<string>();
+
+            for (int i = 0; i < vBands.Count; i++) {
+                for (int j = 0; j < vBands.Count; j++) {
+                    if (i == j) { continue; }
+                    int[] a = vBands[i];
+                    int[] b = vBands[j];
+                    int leftX = a[0], rightX = b[0];
+                    if (rightX <= leftX) { continue; }
+                    int bw = rightX - leftX;
+                    if (bw < minLen || bw > w / 2) { continue; }
+                    int topY = Math.Max(a[2], b[2]);
+                    int botY = Math.Min(a[3], b[3]);
+                    int bh = botY - topY;
+                    if (bh < minLen || bh > h / 2) { continue; }
+
+                    bool topOk = false, botOk = false;
+                    foreach (int[] hb in hBands) {
+                        if (hb[2] <= leftX + tol && hb[3] >= rightX - tol) {
+                            if (hb[0] <= topY + tol * 2 && hb[1] >= topY - tol * 2) { topOk = true; }
+                            if (hb[0] <= botY + tol * 2 && hb[1] >= botY - tol * 2) { botOk = true; }
+                        }
+                    }
+                    if (!topOk || !botOk) { continue; }
+
+                    string key = leftX + "," + topY + "," + rightX + "," + botY;
+                    if (seen.Contains(key)) { continue; }
+                    seen.Add(key);
+                    outv.Add(leftX); outv.Add(topY); outv.Add(rightX); outv.Add(botY);
+                }
+            }
+            return outv.ToArray();
+        }
+    }
+}
+'@
+}
+
 if (-not ([System.Management.Automation.PSTypeName]'MtGV5.QuickOps').Type) {
     Add-Type -TypeDefinition @'
 using System;
