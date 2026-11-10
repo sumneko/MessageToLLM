@@ -1,0 +1,31 @@
+{
+  "game": {
+    "processName": "MessageFromAliens",
+    "expectedWidth": 1920,
+    "expectedHeight": 1080,
+    "captureMethod": "Auto"
+  },
+  "vision": {
+    "inkThreshold": 90,
+    "colorThreshold": 120,
+    "labelMinGap": 8,
+    "rowMergeGap": 8,
+    "sampleSize": 24,
+    "highConfidence": 0.08,
+    "maxDistance": 0.11
+  },
+  "llm": {
+    "provider": "deepseek",
+    "baseUrl": "https://api.deepseek.com",
+    "model": "deepseek-chat",
+    "apiKeyEnv": "DEEPSEEK_API_KEY",
+    "temperature": 0.2,
+    "maxStepsPerDecision": 1,
+    "cacheByStateHash": true
+  },
+  "limits": {
+    "maxSteps": 300,
+    "maxConsecutiveNoEffect": 3,
+    "clickSettleMs": 120
+  }
+}

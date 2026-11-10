@@ -1,0 +1,16 @@
+# 运行时产物
+runs/
+
+# 本地配置（可能含 API Key）
+config.json
+
+# 日志
+*.log
+
+# 编辑器
+.vscode/
+*.code-workspace
+
+# 系统
+Thumbs.db
+desktop.ini
