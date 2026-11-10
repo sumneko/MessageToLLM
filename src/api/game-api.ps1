@@ -767,11 +767,14 @@ function Register-GameTranslationTemplate {
 function Get-GameTranslationText {
     param(
         [Parameter(Mandatory)][string]$SymbolId,
+        [int]$Index = 0,
         [switch]$DryRun
     )
     $api = Get-ApiInstance
     if (-not $api.CellIndex.ContainsKey($SymbolId)) { throw "该符号本次画面里没出现：$SymbolId" }
-    $c = $api.CellIndex[$SymbolId][0]
+    $list = $api.CellIndex[$SymbolId]
+    if ($Index -ge $list.Count) { throw "位置越界：$SymbolId 只有 $($list.Count) 处，请求第 $Index 处" }
+    $c = $list[$Index]
     $slot = Get-TranslationSlotPoint -BlockId $c.BlockId -Row $c.Row -Col $c.Col
     if ($DryRun) {
         return [pscustomobject]@{ SymbolId = $SymbolId; Text = $null; SlotX = $slot.X; SlotY = $slot.Y; DryRun = $true }
@@ -877,15 +880,19 @@ function Sync-GameTranslations {
 }
 
 # 写译文：点译文栏 → 清空 → 粘贴 → 回车；同时更新本地台账
+#   -Index 指定用第几个出现位置（同一个符号在不同位置可能是合并格，写不进去）
 function Set-GameTranslation {
     param(
         [Parameter(Mandatory)][string]$SymbolId,
         [AllowEmptyString()][string]$Text = '',
+        [int]$Index = 0,
         [switch]$DryRun
     )
     $api = Get-ApiInstance
     if (-not $api.CellIndex.ContainsKey($SymbolId)) { throw "该符号本次画面里没出现：$SymbolId" }
-    $c = $api.CellIndex[$SymbolId][0]
+    $list = $api.CellIndex[$SymbolId]
+    if ($Index -ge $list.Count) { throw "位置越界：$SymbolId 只有 $($list.Count) 处，请求第 $Index 处" }
+    $c = $list[$Index]
     $slot = Get-TranslationSlotPoint -BlockId $c.BlockId -Row $c.Row -Col $c.Col
 
     if ($DryRun) {

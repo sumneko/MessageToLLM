@@ -114,7 +114,7 @@ function Get-PanelBlocks {
 function Get-SlotFrames {
     param(
         $LumBuf, [double]$Scale = 1.0, [int]$InkThreshold = 90,
-        [int]$MinLenBase = 50, [int]$MaxThickBase = 8, [int]$TolBase = 6
+        [int]$MinLenBase = 70, [int]$MaxThickBase = 8, [int]$TolBase = 6
     )
     $minLen = [Math]::Max(20, [int][Math]::Round($MinLenBase * $Scale))
     $maxThick = [Math]::Max(3, [int][Math]::Round($MaxThickBase * $Scale))
@@ -130,18 +130,26 @@ function Get-SlotFrames {
             })
     }
 
-    # 去重：上下横线连成一条时会把相邻两个框误检成一个大框，
-    # 凡是被别的框完全包含的，只保留面积更小的那个。
+    # 去重：上下横线连成一条时会把相邻框误检成一个大框，或框内再套一个框。
+    # 判据：两框中心互相包含时只保留面积更小的那个。
     $kept = New-Object System.Collections.Generic.List[object]
     for ($i = 0; $i -lt $out.Count; $i++) {
         $a = $out[$i]
         $drop = $false
+        $acx = ($a.X0 + $a.X1) / 2.0
+        $acy = ($a.Y0 + $a.Y1) / 2.0
+        $areaA = $a.W * $a.H
         for ($j = 0; $j -lt $out.Count; $j++) {
             if ($i -eq $j) { continue }
             $b = $out[$j]
-            if ($a.X0 -le $b.X0 -and $a.X1 -ge $b.X1 -and $a.Y0 -le $b.Y0 -and $a.Y1 -ge $b.Y1) {
-                if (($a.W * $a.H) -gt ($b.W * $b.H)) { $drop = $true; break }
-            }
+            $bcx = ($b.X0 + $b.X1) / 2.0
+            $bcy = ($b.Y0 + $b.Y1) / 2.0
+            $aInB = ($acx -gt $b.X0 -and $acx -lt $b.X1 -and $acy -gt $b.Y0 -and $acy -lt $b.Y1)
+            $bInA = ($bcx -gt $a.X0 -and $bcx -lt $a.X1 -and $bcy -gt $a.Y0 -and $bcy -lt $a.Y1)
+            if (-not ($aInB -or $bInA)) { continue }
+            $areaB = $b.W * $b.H
+            if ($areaA -gt $areaB) { $drop = $true; break }
+            if ($areaA -eq $areaB -and $i -gt $j) { $drop = $true; break }
         }
         if (-not $drop) { $kept.Add($a) }
     }
