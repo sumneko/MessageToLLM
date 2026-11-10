@@ -1,19 +1,23 @@
-# tools/page-dump.ps1 —— 页面导出工具（只读；-Sync 时逐格读游戏内译文）
+# tools/page-dump.ps1 —— 页面导出工具（只读；-Sync 时读游戏内译文）
 #
 # 观察当前画面，把每个块渲染成「符号ID[译文]」的紧凑文本，
 # 译文来自本地台账（data\translations-s.json），它是游戏内译文栏的镜像。
 #
 # 用法：
-#   .\tools\page-dump.ps1                # 抓当前画面，用本地台账显示译文（快）
-#   .\tools\page-dump.ps1 -Sync          # 先逐格读取游戏内译文（慢，约 1 秒/符号）
-#   .\tools\page-dump.ps1 -NoCapture     # 用上次的观察结果（不重新截图）
-#   .\tools\page-dump.ps1 -SaveText      # 额外把文本渲染存到 runs/dump-<时间>/page.txt
+#   .\tools\page-dump.ps1                   # 抓当前画面，用本地台账显示译文（快）
+#   .\tools\page-dump.ps1 -Sync             # 裁剪译文框做像素比对（默认，不占鼠标）
+#   .\tools\page-dump.ps1 -Sync -Method Ocr  # 整页 OCR（能读陌生中文）
+#   .\tools\page-dump.ps1 -Sync -Method Clipboard  # 逐格点读（精确但抢鼠标）
+#   .\tools\page-dump.ps1 -NoCapture        # 用上次的观察结果（不重新截图）
+#   .\tools\page-dump.ps1 -SaveText         # 额外把文本渲染存到 runs/dump-<时间>/page.txt
 
 [CmdletBinding()]
 param(
     [switch]$NoCapture,
     [switch]$Sync,
     [switch]$OnlyNew,
+    [ValidateSet('Crop', 'Ocr', 'Clipboard')][string]$Method = 'Crop',
+    [switch]$Force,
     [switch]$SaveText,
     [switch]$ShowSlots,
     [string]$TransFile
@@ -26,6 +30,7 @@ $root = Split-Path $PSScriptRoot -Parent
 $api = Initialize-GameApi -Root $root -OutDir (Join-Path $root ('runs\dump-' + (Get-Date -Format 'yyyyMMdd-HHmmss')))
 if (-not $NoCapture) {
     $null = Set-GameForeground
+    Start-Sleep -Milliseconds 250   # 切前台后画面要重绘，抢拍会拿到旧帧（尤其切存档后）
     $obs = Get-GameObservation -Force
 }
 else {
@@ -36,8 +41,8 @@ else {
 $trans = Import-GameTranslationMap -Path $TransFile
 $syncInfo = $null
 if ($Sync) {
-    Write-Host '正在逐格读取游戏内译文…' -ForegroundColor DarkGray
-    $syncInfo = Sync-GameTranslations -Path $TransFile -OnlyNew:$OnlyNew
+    Write-Host ("正在读取游戏内译文（{0}）…" -f $Method) -ForegroundColor DarkGray
+    $syncInfo = Sync-GameTranslations -Path $TransFile -OnlyNew:$OnlyNew -Method $Method -Force:$Force
     $trans = Import-GameTranslationMap -Path $TransFile
 }
 
@@ -45,10 +50,21 @@ $lines = New-Object System.Collections.Generic.List[string]
 $lines.Add(('image: ' + $obs.Image))
 $lines.Add(("blocks: {0}  slots: {1}  （灰=灰色条目 `）" -f @($obs.Blocks).Count, @($obs.Slots).Count))
 if ($syncInfo) {
-    $lines.Add(("译文同步：读 {0} 个符号，变化 {1} 个，台账有译文 {2} 个 / 已确认 {3} 个" -f $syncInfo.Read, $syncInfo.Changed, $syncInfo.Known, $syncInfo.Total))
+    if ($syncInfo.Skipped -eq 'all-empty') {
+        $lines.Add(("译文同步（{0}）：读到 0 个非空译文，台账未覆盖。确认要清空用 -Force" -f $syncInfo.Method))
+    }
+    else {
+        $lines.Add(("译文同步（{0}）：读 {1} 个符号，变化 {2} 个，台账有译文 {3} 个 / 已确认 {4} 个" -f $syncInfo.Method, $syncInfo.Read, $syncInfo.Changed, $syncInfo.Known, $syncInfo.Total))
+        if (@($syncInfo.Unknown).Count -gt 0) {
+            $lines.Add(("模板库认不出（{0} 个）：{1}" -f @($syncInfo.Unknown).Count, (@($syncInfo.Unknown) -join ' ')))
+        }
+    }
 }
-$lines.Add('译文记法：[x]=游戏内译文  [空]=译文栏为空  [?]=台账无记录')
+$lines.Add('译文记法：[x]=游戏内译文  [空]=译文栏为空  [未知]=有字但模板库认不出  [?]=台账无记录')
 $lines.Add('')
+
+$unknownSet = @{}
+if ($syncInfo -and $syncInfo.Unknown) { foreach ($u in @($syncInfo.Unknown)) { $unknownSet[$u] = $true } }
 
 foreach ($b in $obs.Blocks) {
     $blk = Get-GameBlock -BlockId $b.BlockId
@@ -59,9 +75,11 @@ foreach ($b in $obs.Blocks) {
     foreach ($r in $rows) {
         $tokens = foreach ($c in ($r.Group | Sort-Object Col)) {
             $tone = $(if ($c.Tone -eq 'gray') { '`' } else { '' })
-            if (-not $trans.ContainsKey($c.SymbolId)) { "$($c.SymbolId)[?]$tone" }
-            elseif ($trans[$c.SymbolId]) { "$($c.SymbolId)[$($trans[$c.SymbolId])]$tone" }
-            else { "$($c.SymbolId)[空]$tone" }
+            if ($trans.ContainsKey($c.SymbolId)) {
+                if ($trans[$c.SymbolId]) { "$($c.SymbolId)[$($trans[$c.SymbolId])]$tone" } else { "$($c.SymbolId)[空]$tone" }
+            }
+            elseif ($unknownSet.ContainsKey($c.SymbolId)) { "$($c.SymbolId)[未知]$tone" }
+            else { "$($c.SymbolId)[?]$tone" }
         }
         $lines.Add(("r{0}: {1}" -f $r.Name, ($tokens -join ' ')))
     }

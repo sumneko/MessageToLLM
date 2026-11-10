@@ -10,7 +10,9 @@
 #   click_symbol(id)     点某个符号最近一次出现的位置
 #   set_translation()    给符号写游戏内译文（剪贴板粘贴；空文本 = 清除）
 #   get_translation()    读符号当前的游戏内译文（点译文栏 → Ctrl+A/C → Esc）
-#   sync_translations()  把整页所有符号的译文读下来，写回本地台账 json
+#   sync_translations()  读当前页面所有符号的译文，写回本地台账 json
+#                         Method=Crop（默认，裁剪译文框做像素比对，毫秒级、不碰鼠标）
+#                         Method=Ocr / Clipboard 为备选
 #   game_state()         running / closed / minimized / not-foreground
 #   start_game()         通过 Steam 启动并等到窗口出现
 #   merge_symbols / split_symbol  台账纠错
@@ -466,7 +468,289 @@ function Get-TranslationSlotPoint {
     return [pscustomobject]@{ X = $ix; Y = $iy; Screen = (Convert-ImagePointToScreen -X $ix -Y $iy -Window $api.Win) }
 }
 
-# 读一个符号当前的游戏内译文；无译文返回空串
+# ─── OCR 读译文（不点鼠标、不抢焦点）──────────────────────────────
+# 走 Windows.Media.Ocr，只能由 PowerShell 5.1 调用（pwsh 7 没有 WinRT 投影）。
+# 实测要点：
+#   · 占位符 '?' 常被识别成 '7'，但它的 bbox 固定（4K 下 18x27）→ 用「尺寸 + 内容」双重判空
+#   · 外星符号本身也会被 OCR 成汉字乱码，用 y 带过滤掉（只取译文栏那一层）
+#   · 游戏不在前台时译文不渲染，整页都会是占位符 —— 这是游戏特性，不是 OCR 的错
+function Invoke-WinRtOcr {
+    param(
+        [Parameter(Mandatory)][string]$ImagePath,
+        [double]$Scale = 2.0,
+        [string]$Region = ''
+    )
+    $api = Get-ApiInstance
+    $script = Join-Path $api.Root 'tools\ocr-winrt.ps1'
+    if (-not (Test-Path $script)) { throw "缺少 OCR 脚本：$script" }
+    $exe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $tmpJson = Join-Path ([IO.Path]::GetTempPath()) ('ocr-' + [Guid]::NewGuid().ToString('N') + '.json')
+    $argList = @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $script,
+        '-Image', $ImagePath, '-Scale', $Scale, '-Out', $tmpJson)
+    if ($Region) { $argList += @('-Region', $Region) }
+    try {
+        $null = & $exe @argList 2>&1
+        if (-not (Test-Path $tmpJson)) { throw 'OCR 没有产出结果' }
+        return (Get-Content $tmpJson -Raw -Encoding UTF8 | ConvertFrom-Json)
+    }
+    finally {
+        Remove-Item $tmpJson -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# 用一次 OCR 读出当前画面所有符号的译文；返回 @{ 符号ID = 文本 }
+function Get-GameTranslationsByOcr {
+    param(
+        [int[]]$BlockId,
+        [double]$Scale = 2.0
+    )
+    $api = Get-ApiInstance
+    if (-not $api.LastImage) { throw '还没有截图：先跑一次观察' }
+    $ocr = Invoke-WinRtOcr -ImagePath $api.LastImage -Scale $Scale
+
+    $words = @()
+    foreach ($ln in @($ocr.Lines)) {
+        $wl = @($ln.Words)
+        if ($wl.Count -gt 0) { $words += $wl }
+        elseif ($ln.Text) {
+            $words += [pscustomobject]@{ T = $ln.Text; X = $ln.X; Y = $ln.Y; W = $ln.W; H = $ln.H }
+        }
+    }
+
+    $winScale = $api.Win.Height / 1080.0
+    $band = 30.0 * $winScale
+    $out = @{}
+    $blocks = if ($BlockId) { @($BlockId) } else { @($api.Grids.Keys | Sort-Object) }
+    foreach ($bid in $blocks) {
+        if (-not $api.Grids.ContainsKey($bid)) { continue }
+        $rows = @($api.Grids[$bid].Cells | Group-Object Row | Sort-Object { [int]$_.Name })
+        foreach ($r in $rows) {
+            $rowCells = @($r.Group | Sort-Object Col)
+            $rowBottom = ($rowCells | ForEach-Object { $_.Y + $_.H } | Measure-Object -Maximum).Maximum
+            $slotY = $rowBottom + 26 * $winScale
+            $buckets = @{}
+            foreach ($w in $words) {
+                $cy = $w.Y + $w.H / 2.0
+                if ($cy -lt ($slotY - $band) -or $cy -gt ($slotY + $band)) { continue }
+                $cx = $w.X + $w.W / 2.0
+                foreach ($c in $rowCells) {
+                    if ($cx -ge ($c.X - $c.W * 0.25) -and $cx -lt ($c.X + $c.W * 1.25)) {
+                        if (-not $buckets.ContainsKey($c.SymbolId)) { $buckets[$c.SymbolId] = New-Object System.Collections.Generic.List[object] }
+                        $buckets[$c.SymbolId].Add($w)
+                        break
+                    }
+                }
+            }
+            foreach ($c in $rowCells) {
+                if ($out.ContainsKey($c.SymbolId)) { continue }
+                $text = ''
+                if ($buckets.ContainsKey($c.SymbolId)) {
+                    $ws = @($buckets[$c.SymbolId] | Sort-Object X)
+                    $joined = ((($ws | ForEach-Object { $_.T }) -join '') -replace ' ', '')
+                    if ($ws.Count -eq 1) {
+                        $w0 = $ws[0]
+                        $isPlaceholder = ($w0.W -le (12 * $winScale)) -and ($w0.H -le (18 * $winScale)) -and ($joined -match '^[?？7]$')
+                        if ($isPlaceholder) { $joined = '' }
+                    }
+                    $text = $joined
+                }
+                $out[$c.SymbolId] = $text
+            }
+        }
+    }
+    return $out
+}
+
+# ─── 译文框裁剪识别（默认方案：最快、零干扰）────────────────────
+# 译文就渲染在符号正下方固定偏移处，且游戏字体固定 ⇒ 同一字符的图像签名几乎完全一致。
+# 因此「判空」和「已知字符识别」都只需像素比对：不调 OCR、不碰鼠标。
+# 实测：同页所有 '?' 的签名距离 = 0；'?' 与最近的非空字符（「是」）= 0.492。
+
+function Get-GameTranslationTemplatePath {
+    $api = Get-ApiInstance
+    return (Join-Path $api.Root 'data\translation-templates.json')
+}
+
+function Import-TranslationTemplates {
+    $p = Get-GameTranslationTemplatePath
+    $tpl = @{ Placeholder = ''; Chars = @{}; N = 16; Threshold = 70 }
+    if (Test-Path $p) {
+        try {
+            $j = Get-Content $p -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($j.Placeholder) { $tpl.Placeholder = [string]$j.Placeholder }
+            if ($j.N) { $tpl.N = [int]$j.N }
+            if ($j.Threshold) { $tpl.Threshold = [int]$j.Threshold }
+            if ($j.Chars) { foreach ($pr in $j.Chars.PSObject.Properties) { $tpl.Chars[$pr.Name] = [string]$pr.Value } }
+        }
+        catch { }
+    }
+    return $tpl
+}
+
+function Save-TranslationTemplates {
+    param([hashtable]$Templates)
+    $p = Get-GameTranslationTemplatePath
+    $dir = Split-Path $p -Parent
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $obj = [ordered]@{
+        N           = $Templates.N
+        Threshold   = $Templates.Threshold
+        Placeholder = $Templates.Placeholder
+        Chars       = $Templates.Chars
+    }
+    ($obj | ConvertTo-Json -Depth 4) | Set-Content -Path $p -Encoding UTF8
+    return $p
+}
+
+# 把截图读成亮度表（整图一次，后续裁剪走 C#）
+function Get-LumSnapshot {
+    param([Parameter(Mandatory)][string]$Path)
+    $bmp = [System.Drawing.Bitmap]::FromFile($Path)
+    try {
+        $rect = [System.Drawing.Rectangle]::new(0, 0, $bmp.Width, $bmp.Height)
+        $data = $bmp.LockBits($rect, [System.Drawing.Imaging.ImageLockMode]::ReadOnly, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+        $stride = $data.Stride
+        $bytes = [byte[]]::new($stride * $bmp.Height)
+        [System.Runtime.InteropServices.Marshal]::Copy($data.Scan0, $bytes, 0, $bytes.Length)
+        $bmp.UnlockBits($data)
+        $w = $bmp.Width; $h = $bmp.Height
+    }
+    finally { $bmp.Dispose() }
+    $lum = [MtGV5.QuickOps]::Lum($bytes, $w, $h, $stride)
+    return [pscustomobject]@{ Lum = $lum; W = $w; H = $h }
+}
+
+# 译文框 = 格子横向范围、行底边下方 15 参考像素起、高 23 参考像素
+# （4K 实测文字落在 rowBottom+35..70，即参考空间 17.5..35，这里留出上下余量）
+function Get-TranslationSignature {
+    param($Snap, $Cell, [int]$RowBottom, [int]$N, [int]$Thr)
+    $api = Get-ApiInstance
+    $scale = $api.Win.Height / 1080.0
+    $x = [int]$Cell.X
+    $y = [int]($RowBottom + 15 * $scale)
+    $w = [int]$Cell.W
+    $h = [int][Math]::Round(23 * $scale)
+    if ($x -lt 0) { $w += $x; $x = 0 }
+    if ($y -lt 0) { $h += $y; $y = 0 }
+    if ($x + $w -gt $Snap.W) { $w = $Snap.W - $x }
+    if ($y + $h -gt $Snap.H) { $h = $Snap.H - $y }
+    if ($w -lt 4 -or $h -lt 4) { return [pscustomobject]@{ Sig = ''; InkW = 0; InkH = 0; InkCount = 0 } }
+    $iw = 0; $ih = 0; $ic = 0
+    $sig = [MtGV8.TransBox]::Sign($Snap.Lum, $Snap.W, $x, $y, $w, $h, $N, $Thr, [ref]$iw, [ref]$ih, [ref]$ic)
+    return [pscustomobject]@{ Sig = $sig; InkW = $iw; InkH = $ih; InkCount = $ic }
+}
+
+# 用像素比对读当前画面所有符号的译文
+#   值 = ''        无译文（等同于占位符 ?）
+#   值 = 字符串    命中了字符模板库
+#   值 = $null     有内容但识别不出（调用方决定怎么处理）
+function Get-GameTranslationsByCrop {
+    param(
+        [int[]]$BlockId,
+        [int]$N = 0,
+        [int]$Thr = 0,
+        [double]$Tol = 0.1,
+        [switch]$RelearnPlaceholder
+    )
+    $api = Get-ApiInstance
+    if (-not $api.LastImage) { throw '还没有截图：先跑一次观察' }
+    $tpl = Import-TranslationTemplates
+    if ($N -le 0) { $N = $tpl.N }
+    if ($Thr -le 0) { $Thr = $tpl.Threshold }
+    $snap = Get-LumSnapshot -Path $api.LastImage
+
+    $blocks = if ($BlockId) { @($BlockId) } else { @($api.Grids.Keys | Sort-Object) }
+    $sigs = @{}
+    $meta = @{}
+    foreach ($bid in $blocks) {
+        if (-not $api.Grids.ContainsKey($bid)) { continue }
+        $rows = @($api.Grids[$bid].Cells | Group-Object Row | Sort-Object { [int]$_.Name })
+        foreach ($r in $rows) {
+            $rowCells = @($r.Group | Sort-Object Col)
+            $rowBottom = ($rowCells | ForEach-Object { $_.Y + $_.H } | Measure-Object -Maximum).Maximum
+            foreach ($c in $rowCells) {
+                $s = Get-TranslationSignature -Snap $snap -Cell $c -RowBottom $rowBottom -N $N -Thr $Thr
+                if (-not $sigs.ContainsKey($c.SymbolId)) {
+                    $sigs[$c.SymbolId] = $s.Sig
+                    $meta[$c.SymbolId] = $s
+                }
+            }
+        }
+    }
+
+    # 占位符模板：显式重学，或模板库里还没有时自动检测（取出现次数最多的非空签名）
+    if ($RelearnPlaceholder -or -not $tpl.Placeholder) {
+        $counts = @{}
+        foreach ($k in $sigs.Keys) {
+            $v = $sigs[$k]
+            if ($v) { if ($counts.ContainsKey($v)) { $counts[$v] = $counts[$v] + 1 } else { $counts[$v] = 1 } }
+        }
+        if ($counts.Count -gt 0) {
+            $best = ($counts.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 1)
+            $tpl.Placeholder = $best.Key
+            $tpl.N = $N
+            $tpl.Threshold = $Thr
+            $null = Save-TranslationTemplates -Templates $tpl
+        }
+    }
+
+    $out = @{}
+    $unknown = New-Object System.Collections.Generic.List[string]
+    foreach ($k in $sigs.Keys) {
+        $sig = $sigs[$k]
+        if (-not $sig) { $out[$k] = ''; continue }
+        if ($tpl.Placeholder -and ([MtGV8.TransBox]::Dist($sig, $tpl.Placeholder) -le $Tol)) { $out[$k] = ''; continue }
+        $hit = ''
+        $bestD = 1.0
+        foreach ($ch in $tpl.Chars.Keys) {
+            $d = [MtGV8.TransBox]::Dist($sig, $tpl.Chars[$ch])
+            if ($d -lt $bestD) { $bestD = $d; $hit = $ch }
+        }
+        if ($hit -and $bestD -le $Tol) { $out[$k] = $hit }
+        else { $out[$k] = $null; $unknown.Add($k) }
+    }
+    return [pscustomobject]@{ Map = $out; Unknown = @($unknown); Placeholder = $tpl.Placeholder; Templates = $tpl }
+}
+
+# 把「符号 → 文本」登记进字符模板库（用当前画面里的图像），用于以后自动识别
+function Register-GameTranslationTemplate {
+    param(
+        [Parameter(Mandatory)][hashtable]$Pairs,
+        [int]$N = 0,
+        [int]$Thr = 0
+    )
+    $api = Get-ApiInstance
+    if (-not $api.LastImage) { throw '还没有截图：先跑一次观察' }
+    $tpl = Import-TranslationTemplates
+    if ($N -le 0) { $N = $tpl.N }
+    if ($Thr -le 0) { $Thr = $tpl.Threshold }
+    $snap = Get-LumSnapshot -Path $api.LastImage
+    $added = New-Object System.Collections.Generic.List[string]
+    foreach ($id in $Pairs.Keys) {
+        $text = [string]$Pairs[$id]
+        if (-not $text) { continue }
+        $loc = $null
+        foreach ($bid in ($api.Grids.Keys | Sort-Object)) {
+            $hit = @($api.Grids[$bid].Cells | Where-Object { $_.SymbolId -eq $id })
+            if ($hit.Count -gt 0) { $loc = @{ BlockId = $bid; Cell = $hit[0] }; break }
+        }
+        if (-not $loc) { continue }
+        $rowCells = @($api.Grids[$loc.BlockId].Cells | Where-Object { $_.Row -eq $loc.Cell.Row })
+        $rowBottom = ($rowCells | ForEach-Object { $_.Y + $_.H } | Measure-Object -Maximum).Maximum
+        $s = Get-TranslationSignature -Snap $snap -Cell $loc.Cell -RowBottom $rowBottom -N $N -Thr $Thr
+        if (-not $s.Sig) { continue }
+        foreach ($ch in $text.ToCharArray()) {
+            $key = [string]$ch
+            if (-not $tpl.Chars.ContainsKey($key)) { $tpl.Chars[$key] = $s.Sig; $added.Add($key) }
+        }
+    }
+    $tpl.N = $N
+    $tpl.Threshold = $Thr
+    $null = Save-TranslationTemplates -Templates $tpl
+    return [pscustomobject]@{ Added = @($added); Total = $tpl.Chars.Count }
+}
+
+# 读一个符号当前的游戏内译文；无译文返回空串（剪贴板法：精确但会抢焦点）
 function Get-GameTranslationText {
     param(
         [Parameter(Mandatory)][string]$SymbolId,
@@ -496,51 +780,85 @@ function Get-GameTranslationText {
     return [pscustomobject]@{ SymbolId = $SymbolId; Text = $text; SlotX = $slot.X; SlotY = $slot.Y; DryRun = $false }
 }
 
-# 同步整页译文：逐格读游戏内译文栏，写回本地台账并返回映射
+# 同步整页译文：读游戏内译文栏，写回本地台账并返回映射
+#   -Method Crop      裁剪译文框做像素比对（默认，几十毫秒、不碰鼠标；未知字符不覆盖台账）
+#   -Method Ocr       整页 OCR（能读陌生中文，但满屏占位符时几乎无输出）
+#   -Method Clipboard 逐格点进译文栏 Ctrl+A/C 读取（最精确，但会占用鼠标和焦点）
 function Sync-GameTranslations {
     param(
         [int[]]$BlockId,
         [string]$Path,
         [switch]$OnlyNew,
+        [ValidateSet('Crop', 'Ocr', 'Clipboard')][string]$Method = 'Crop',
+        [switch]$Force,
         [switch]$PassThru
     )
     $api = Get-ApiInstance
     if (-not $api.Win) { throw '还没有窗口几何：先跑一次观察' }
     $map = Import-GameTranslationMap -Path $Path
-    $order = @()
-    if ($BlockId) { $order = @($BlockId) }
-    else { $order = @($api.Grids.Keys | Sort-Object) }
+    $unknown = @()
 
-    $ids = New-Object System.Collections.Generic.List[string]
-    $seen = @{}
-    foreach ($bid in $order) {
-        if (-not $api.Grids.ContainsKey($bid)) { continue }
-        foreach ($cc in ($api.Grids[$bid].Cells | Sort-Object Row, Col)) {
-            if (-not $seen.ContainsKey($cc.SymbolId)) { $seen[$cc.SymbolId] = $true; $ids.Add($cc.SymbolId) }
+    if ($Method -eq 'Crop') {
+        $null = Set-GameForeground
+        if (-not $api.LastImage) { $null = Get-GameObservation -Force }
+        $crop = Get-GameTranslationsByCrop -BlockId $BlockId
+        $readMap = $crop.Map
+        $unknown = @($crop.Unknown)
+    }
+    elseif ($Method -eq 'Ocr') {
+        $null = Set-GameForeground   # 译文只在游戏前台渲染
+        if (-not $api.LastImage) { $null = Get-GameObservation -Force }
+        $readMap = Get-GameTranslationsByOcr -BlockId $BlockId
+    }
+    else {
+        $readMap = @{}
+        $order = if ($BlockId) { @($BlockId) } else { @($api.Grids.Keys | Sort-Object) }
+        $ids = New-Object System.Collections.Generic.List[string]
+        $seen = @{}
+        foreach ($bid in $order) {
+            if (-not $api.Grids.ContainsKey($bid)) { continue }
+            foreach ($cc in ($api.Grids[$bid].Cells | Sort-Object Row, Col)) {
+                if (-not $seen.ContainsKey($cc.SymbolId)) { $seen[$cc.SymbolId] = $true; $ids.Add($cc.SymbolId) }
+            }
         }
+        $i = 0
+        foreach ($id in $ids) {
+            $i++
+            Write-Progress -Activity '同步游戏内译文（剪贴板）' -Status "$id ($i/$($ids.Count))" -PercentComplete (100.0 * $i / [Math]::Max(1, $ids.Count))
+            $r = Get-GameTranslationText -SymbolId $id
+            $readMap[$id] = $r.Text
+        }
+        Write-Progress -Activity '同步游戏内译文（剪贴板）' -Completed
     }
 
     $changed = 0
-    $i = 0
     $read = 0
-    foreach ($id in $ids) {
-        $i++
+    $skipped = 0
+    foreach ($id in $readMap.Keys) {
         if ($OnlyNew -and $map.ContainsKey($id)) { continue }
-        Write-Progress -Activity '同步游戏内译文' -Status "$id ($i/$($ids.Count))" -PercentComplete (100.0 * $i / [Math]::Max(1, $ids.Count))
-        $r = Get-GameTranslationText -SymbolId $id
         $read++
-        if ($r.Text) {
-            if (-not $map.ContainsKey($id) -or $map[$id] -ne $r.Text) { $map[$id] = $r.Text; $changed++ }
+        $raw = $readMap[$id]
+        if ($null -eq $raw) { $skipped++; continue }   # 有内容但识别不出：不动台账
+        $text = [string]$raw
+        if ($text) {
+            if (-not $map.ContainsKey($id) -or $map[$id] -ne $text) { $map[$id] = $text; $changed++ }
         }
         elseif (-not $map.ContainsKey($id) -or $map[$id] -ne '') {
             $map[$id] = ''; $changed++
         }
     }
-    Write-Progress -Activity '同步游戏内译文' -Completed
+
+    # 保护：读到 0 个非空译文但台账本来有内容 —— 多半是游戏失焦（译文不渲染）或切档，
+    # 直接覆盖会把已有数据清光。确认要清就用 -Force。
+    $knownBefore = @($map.Keys | Where-Object { $map[$_] }).Count
+    $incoming = @($readMap.Keys | Where-Object { $readMap[$_] }).Count
+    if ($incoming -eq 0 -and $changed -gt 0 -and -not $Force) {
+        return [pscustomobject]@{ Method = $Method; Read = $read; Changed = 0; Known = $knownBefore; Total = $map.Count; Path = ''; Skipped = 'all-empty'; Unknown = @($unknown) }
+    }
 
     $savedPath = Save-GameTranslationMap -Map $map -Path $Path
     $known = @($map.Keys | Where-Object { $map[$_] }).Count
-    $out = [pscustomobject]@{ Read = $read; Changed = $changed; Known = $known; Total = $map.Count; Path = $savedPath }
+    $out = [pscustomobject]@{ Method = $Method; Read = $read; Changed = $changed; Known = $known; Total = $map.Count; Path = $savedPath; Skipped = $(if ($skipped -gt 0) { "$skipped-unknown" } else { '' }); Unknown = @($unknown) }
     if ($PassThru) { $out | Add-Member -NotePropertyName Map -NotePropertyValue $map }
     return $out
 }

@@ -57,6 +57,58 @@ namespace MtGV7 {
 '@
 }
 
+if (-not ([System.Management.Automation.PSTypeName]'MtGV8.TransBox').Type) {
+    Add-Type -TypeDefinition @'
+using System;
+namespace MtGV8 {
+    public class TransBox {
+        // 译文栏签名：把框内墨迹取紧包围盒后重采样成 n×n 二值串（'1' = 墨迹）。
+        // 游戏字体固定，所以同一字符在不同位置的签名几乎完全一致（实测距离 = 0）。
+        // 无墨迹（译文栏为空）时返回空串。
+        public static string Sign(byte[] lum, int stride, int x, int y, int w, int h, int n, int thr,
+                                  out int inkW, out int inkH, out int inkCount) {
+            int minX = w, minY = h, maxX = -1, maxY = -1, ink = 0;
+            for (int j = 0; j < h; j++) {
+                int row = (y + j) * stride;
+                for (int i = 0; i < w; i++) {
+                    if (lum[row + x + i] > thr) {
+                        ink++;
+                        if (i < minX) minX = i;
+                        if (i > maxX) maxX = i;
+                        if (j < minY) minY = j;
+                        if (j > maxY) maxY = j;
+                    }
+                }
+            }
+            inkCount = ink; inkW = 0; inkH = 0;
+            if (maxX < 0) return "";
+            int bw = maxX - minX + 1, bh = maxY - minY + 1;
+            inkW = bw; inkH = bh;
+            char[] buf = new char[n * n];
+            for (int j = 0; j < n; j++) {
+                int sy = minY + j * bh / n;
+                int row = (y + sy) * stride;
+                for (int i = 0; i < n; i++) {
+                    int sx = minX + i * bw / n;
+                    buf[j * n + i] = lum[row + x + sx] > thr ? '1' : '0';
+                }
+            }
+            return new string(buf);
+        }
+
+        // 汉明距离归一化到 0-1
+        public static double Dist(string a, string b) {
+            if (string.IsNullOrEmpty(a) || string.IsNullOrEmpty(b)) return 1.0;
+            int n = Math.Min(a.Length, b.Length);
+            int d = 0;
+            for (int i = 0; i < n; i++) { if (a[i] != b[i]) d++; }
+            return (double)d / n;
+        }
+    }
+}
+'@
+}
+
 if (-not ([System.Management.Automation.PSTypeName]'MtGV5.QuickOps').Type) {
     Add-Type -TypeDefinition @'
 using System;
