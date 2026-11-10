@@ -15,6 +15,48 @@ try {
 # 逐像素扫描在 PowerShell 里是解释执行的：4K 全屏（830 万像素）一次亮度表就要 900ms，
 # 行/列投影、剥分隔线再各接近 1s。这些全是机械运算、没有语义，下沉到 C# 后降到毫秒级。
 # 注意：Add-Type 的类型不能在同一会话重复定义，改了定义要换命名空间。
+if (-not ([System.Management.Automation.PSTypeName]'MtGV7.GridScan').Type) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+namespace MtGV7 {
+    public class GridScan {
+        // 固定网格扫描：格子中心 = (cellW/2 + n*cellW, cellW/2 + m*rowPitch)
+        // 每格取 (half*2) x (half*2) 的固定裁剪框；框内墨迹数不足 minInk 则跳过。
+        // 返回每 7 个一组：gridRow, gridCol, x0, y0, w, h, inkCount
+        public static int[] Scan(byte[] lum, int w, int h,
+                                 int cellW, int rowPitch, int half,
+                                 int threshold, int bx, int by, int bw, int bh, int minInk) {
+            List<int> res = new List<int>();
+            int mFrom = (int)Math.Floor((by - cellW / 2.0) / rowPitch);
+            int mTo = (int)Math.Ceiling((by + bh - cellW / 2.0) / rowPitch);
+            int nFrom = (int)Math.Floor((bx - cellW / 2.0) / cellW);
+            int nTo = (int)Math.Ceiling((bx + bw - cellW / 2.0) / cellW);
+            for (int m = mFrom; m <= mTo; m++) {
+                int cy = (int)Math.Round(cellW / 2.0 + m * (double)rowPitch);
+                if (cy < by || cy >= by + bh) continue;
+                for (int n = nFrom; n <= nTo; n++) {
+                    int cx = (int)Math.Round(cellW / 2.0 + n * (double)cellW);
+                    if (cx < bx || cx >= bx + bw) continue;
+                    int x0 = cx - half, y0 = cy - half;
+                    int cw = half * 2, ch = half * 2;
+                    if (x0 < 0 || y0 < 0 || x0 + cw > w || y0 + ch > h) continue;
+                    int ink = 0;
+                    for (int y = y0; y < y0 + ch; y++) {
+                        int off = y * w;
+                        for (int x = x0; x < x0 + cw; x++) { if (lum[off + x] >= threshold) ink++; }
+                    }
+                    if (ink < minInk) continue;
+                    res.Add(m); res.Add(n); res.Add(x0); res.Add(y0); res.Add(cw); res.Add(ch); res.Add(ink);
+                }
+            }
+            return res.ToArray();
+        }
+    }
+}
+'@
+}
+
 if (-not ([System.Management.Automation.PSTypeName]'MtGV5.QuickOps').Type) {
     Add-Type -TypeDefinition @'
 using System;
@@ -304,6 +346,31 @@ namespace MtGV5 {
 '@ -ErrorAction Stop
 }
 
+# 墨迹色调统计（白 / 灰判定）。新类型必须换命名空间：Add-Type 不能在同会话重复定义。
+if (-not ([System.Management.Automation.PSTypeName]'MtGV6.InkTone').Type) {
+    Add-Type -TypeDefinition @'
+using System;
+namespace MtGV6 {
+    public class InkTone {
+        // 区域内墨迹统计：返回 [inkCount, meanLum]（lum >= threshold 的像素）
+        public static double[] CellStats(byte[] lum, int w, int h, int x, int y, int bw, int bh, int threshold) {
+            long n = 0; double sum = 0;
+            int y0 = Math.Max(0, y), y1 = Math.Min(h - 1, y + bh - 1);
+            int x0 = Math.Max(0, x), x1 = Math.Min(w - 1, x + bw - 1);
+            for (int yy = y0; yy <= y1; yy++) {
+                int off = yy * w;
+                for (int xx = x0; xx <= x1; xx++) {
+                    int v = lum[off + xx];
+                    if (v >= threshold) { n++; sum += v; }
+                }
+            }
+            return new double[] { n, n > 0 ? sum / n : 0 };
+        }
+    }
+}
+'@ -ErrorAction Stop
+}
+
 # ---------------------------------------------------------------- 读图
 
 function Open-ImagePlain {
@@ -343,25 +410,40 @@ function Get-LumBuffer {
 
 # ---------------------------------------------------------------- 墨迹包围盒
 
+# 墨迹包围盒。MinCount = 该行/列至少要有几个墨迹像素才算数（滤掉孤点噪点）。
+# 阈值要低到能盖住灰色条目的抗锯齿边：灰墨迹峰值只有 ~92，用 90 会把边缘裁掉。
 function Get-InkBounds {
-    param($LumBuf, [int]$X0, [int]$Y0, [int]$W, [int]$H, [int]$Threshold = 90)
-    $minX = [int]::MaxValue; $minY = [int]::MaxValue; $maxX = -1; $maxY = -1
+    param($LumBuf, [int]$X0, [int]$Y0, [int]$W, [int]$H, [int]$Threshold = 90, [int]$MinCount = 1)
     $imgW = $LumBuf.Width
     $imgH = $LumBuf.Height
+    $x0 = [Math]::Max(0, $X0)
+    $y0 = [Math]::Max(0, $Y0)
     $xEnd = [Math]::Min($X0 + $W, $imgW)
     $yEnd = [Math]::Min($Y0 + $H, $imgH)
-    for ($y = [Math]::Max(0, $Y0); $y -lt $yEnd; $y++) {
+    $rows = @{}
+    $cols = @{}
+    for ($y = $y0; $y -lt $yEnd; $y++) {
         $rowOff = $y * $imgW
-        for ($x = [Math]::Max(0, $X0); $x -lt $xEnd; $x++) {
+        for ($x = $x0; $x -lt $xEnd; $x++) {
             if ($LumBuf.Lum[$rowOff + $x] -ge $Threshold) {
-                if ($x -lt $minX) { $minX = $x }
-                if ($x -gt $maxX) { $maxX = $x }
-                if ($y -lt $minY) { $minY = $y }
-                if ($y -gt $maxY) { $maxY = $y }
+                $rows[$y] = 1 + $(if ($rows.ContainsKey($y)) { $rows[$y] } else { 0 })
+                $cols[$x] = 1 + $(if ($cols.ContainsKey($x)) { $cols[$x] } else { 0 })
             }
         }
     }
-    if ($maxX -lt 0) { return $null }
+    if ($rows.Count -eq 0) { return $null }
+    $minX = [int]::MaxValue; $maxX = -1; $minY = [int]::MaxValue; $maxY = -1
+    foreach ($k in $rows.Keys) {
+        if ($rows[$k] -lt $MinCount) { continue }
+        if ($k -lt $minY) { $minY = $k }
+        if ($k -gt $maxY) { $maxY = $k }
+    }
+    foreach ($k in $cols.Keys) {
+        if ($cols[$k] -lt $MinCount) { continue }
+        if ($k -lt $minX) { $minX = $k }
+        if ($k -gt $maxX) { $maxX = $k }
+    }
+    if ($maxX -lt 0 -or $maxY -lt 0) { return $null }
     return [pscustomobject]@{ X = $minX; Y = $minY; W = ($maxX - $minX + 1); H = ($maxY - $minY + 1) }
 }
 
@@ -430,8 +512,9 @@ function Get-InkRowBands {
 # 步骤：1) 切所有墨迹带；2) 间距很小的带先合并（把贴着的横线并进字形行）；
 #      3) 只保留高度≥最高的 HeightRatio 倍的带（= 图形行，排除文字行）；
 #      4) 再按 PadRatio 略微外扩，但不越过相邻墨迹带。
+# 注意：RowMergeGap 必须小 —— 译文行与字形的间隙只有 ~13px(4K)，阈值过大会把译文吞进符号行。
 function Get-GlyphRowBands {
-    param($LumBuf, [int]$Threshold = 90, [int]$MinGap = 2, [int]$RowMergeGap = 8,
+    param($LumBuf, [int]$Threshold = 90, [int]$MinGap = 2, [int]$RowMergeGap = 4,
         [double]$HeightRatio = 0.55, [double]$PadRatio = 0.10)
     $raw = @(Get-InkRowBands -LumBuf $LumBuf -Threshold $Threshold -MinGap $MinGap -MinBand 1)
     if ($raw.Count -eq 0) { return @() }
@@ -527,19 +610,40 @@ function Remove-SeparatorLines {
 }
 
 # 行布局：把图形行和它下面那行文字配成对。游戏里两者都是对齐到同一网格的。
+#
+# 行带合并规则（自适应）：
+#   - 小间隙（≤ RowMergeGap，如下划线紧贴文字）→ 合并；
+#   - 字形内部间隙（如灰色小号「又」上下两笔，约 16px@4K ≈ 0.12×字高）→ 合并，
+#     判据 = gap 不超过 maxRawH×GapRatio 且合并后总高度不超过 maxRawH×1.15；
+#   - 字形与译文行之间（约 35px@4K ≈ 0.26×字高）→ 不合并。
 function Get-RowLayout {
-    param($LumBuf, [int]$Threshold = 90, [int]$MinGap = 2, [int]$RowMergeGap = 8,
-        [double]$HeightRatio = 0.55, [double]$PadRatio = 0.10)
+    param($LumBuf, [int]$Threshold = 90, [int]$MinGap = 2, [int]$RowMergeGap = 4,
+        [double]$HeightRatio = 0.45, [double]$PadRatio = 0.10, [double]$MergeSpanRatio = 1.15,
+        [double]$GapRatio = 0.15)
     $raw = @(Get-InkRowBands -LumBuf $LumBuf -Threshold $Threshold -MinGap $MinGap -MinBand 1)
     if ($raw.Count -eq 0) { return @() }
 
+    # 全页最高墨迹高度（未合并前），作为「字形最大合理高度」的估计
+    $maxRawH = 0
+    foreach ($b in $raw) {
+        $h = $b.Y1 - $b.Y0 + 1
+        if ($h -gt $maxRawH) { $maxRawH = $h }
+    }
+    $mergeSpan = [int][Math]::Round($maxRawH * $MergeSpanRatio)
+    $mergeGapCap = [int][Math]::Round($maxRawH * $GapRatio)
+
     $merged = New-Object System.Collections.Generic.List[object]
     foreach ($b in $raw) {
-        if ($merged.Count -gt 0 -and ($b.Y0 - $merged[$merged.Count - 1].Y1 - 1) -le $RowMergeGap) {
-            $merged[$merged.Count - 1] = [pscustomobject]@{ Y0 = $merged[$merged.Count - 1].Y0; Y1 = $b.Y1 }
-        } else {
-            $merged.Add([pscustomobject]@{ Y0 = $b.Y0; Y1 = $b.Y1 })
+        if ($merged.Count -gt 0) {
+            $last = $merged[$merged.Count - 1]
+            $gap = $b.Y0 - $last.Y1 - 1
+            $spanIfMerged = $b.Y1 - $last.Y0 + 1
+            if ($gap -le $RowMergeGap -or ($gap -le $mergeGapCap -and $spanIfMerged -le $mergeSpan)) {
+                $merged[$merged.Count - 1] = [pscustomobject]@{ Y0 = $last.Y0; Y1 = $b.Y1 }
+                continue
+            }
         }
+        $merged.Add([pscustomobject]@{ Y0 = $b.Y0; Y1 = $b.Y1 })
     }
 
     $maxH = 0

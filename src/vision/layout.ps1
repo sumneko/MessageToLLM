@@ -152,205 +152,72 @@ function Clear-FrameBorders {
     }
 }
 
-# ---------------------------------------------------------------- 网格归并
 #
-# 游戏 UI 是固定网格：符号在格内居中，一行内相邻符号的中心差是格宽的整数倍。
-# 但笔画之间（例如 III 的三根竖线）的中心差只有格宽的 1/3 左右，必须先归列再合并，
-# 否则 III 会被拆成 3 个 I。
-#
-# 格宽推断：对「同一行内相邻符号中心的差」做聚类，取成员最多的簇作为格宽；
-# 再用「画面宽 / 格宽」取整修正（格宽通常是窗口宽的 1/24）。
-
-function Get-CellMetrics {
-    param($Cells, [int]$ImageWidth, [double]$Tolerance = 0.05)
-    $diffs = New-Object System.Collections.Generic.List[double]
-    $byRow = $Cells | Group-Object Row
-    foreach ($r in $byRow) {
-        $items = @($r.Group | Sort-Object X)
-        $centers = @($items | ForEach-Object { $_.X + $_.W / 2.0 })
-        for ($i = 1; $i -lt $centers.Count; $i++) {
-            $d = $centers[$i] - $centers[$i - 1]
-            if ($d -gt 2) { $diffs.Add($d) }
-        }
-    }
-    if ($diffs.Count -eq 0) { return $null }
-
-    # 按容差聚类，取最大簇
-    $clusters = New-Object System.Collections.Generic.List[object]
-    foreach ($d in ($diffs | Sort-Object)) {
-        $hit = $null
-        foreach ($c in $clusters) {
-            if ([Math]::Abs($c.Center - $d) -le $c.Center * $Tolerance) { $hit = $c; break }
-        }
-        if ($hit) {
-            $hit.Sum += $d
-            $hit.N++
-            $hit.Center = $hit.Sum / $hit.N
-        }
-        else {
-            $clusters.Add([pscustomobject]@{ Center = $d; Sum = $d; N = 1 })
-        }
-    }
-    $best = $clusters | Sort-Object N -Descending | Select-Object -First 1
-    if (-not $best -or $best.Center -lt 4) { return $null }
-
-    # 用「画面宽 / 格宽」取整修正：格宽应整除画面宽
-    $cols = [Math]::Max(1, [int][Math]::Round($ImageWidth / $best.Center))
-    $cellW = $ImageWidth / $cols
-
-    # 列内偏移：所有中心对格宽取模后的众数
-    $buckets = @{}
-    foreach ($c in $Cells) {
-        $mod = ((($c.X + $c.W / 2.0) % $cellW) + $cellW) % $cellW
-        $key = [int][Math]::Round($mod / 2) * 2
-        if (-not $buckets.ContainsKey($key)) { $buckets[$key] = New-Object System.Collections.Generic.List[double] }
-        $buckets[$key].Add($mod)
-    }
-    $topBucket = $buckets.GetEnumerator() | Sort-Object { $_.Value.Count } -Descending | Select-Object -First 1
-    $offset = 0.0
-    if ($topBucket) {
-        $sum = 0.0
-        foreach ($v in $topBucket.Value) { $sum += $v }
-        $offset = $sum / $topBucket.Value.Count
-    }
-
-    return [pscustomobject]@{
-        CellW    = [Math]::Round($cellW, 3)
-        Offset   = [Math]::Round($offset, 3)
-        Cols     = $cols
-        Confidence = [Math]::Round($best.N / [double]$diffs.Count, 3)
-    }
-}
-
-# 把同一行内落到同一列的多个墨迹块合并成一个符号（III 的三根竖线 → 一个 III）
-function Merge-CellsByGrid {
-    param($Grid, $Metrics, [int]$BlockX = 0, [int]$ImageWidth = 1, [int]$ImageHeight = 1)
-    $out = New-Object System.Collections.Generic.List[object]
-    $byRow = $Grid.Cells | Group-Object Row
-    $maxCol = 0
-    # 块起点对应的全局列号，扣掉后得到块内列号（从 1 开始）
-    $baseCol = [int][Math]::Round(($BlockX - $Metrics.Offset) / $Metrics.CellW)
-    foreach ($r in $byRow) {
-        $groups = @{}
-        foreach ($c in $r.Group) {
-            $cx = $c.X + $c.W / 2.0
-            $col0 = [int][Math]::Round(($cx - $Metrics.Offset) / $Metrics.CellW)
-            if (-not $groups.ContainsKey($col0)) { $groups[$col0] = New-Object System.Collections.Generic.List[object] }
-            $groups[$col0].Add($c)
-        }
-        foreach ($col0 in ($groups.Keys | Sort-Object)) {
-            $items = $groups[$col0]
-            if ($items.Count -eq 1) {
-                $it = $items[0]
-                $x0 = $it.X; $y0 = $it.Y; $x1 = $it.X + $it.W; $y1 = $it.Y + $it.H
-                $gap = $it.GapPrev
-            }
-            else {
-                $x0 = ($items | Measure-Object X -Minimum).Minimum
-                $y0 = ($items | Measure-Object Y -Minimum).Minimum
-                $x1 = ($items | ForEach-Object { $_.X + $_.W } | Measure-Object -Maximum).Maximum
-                $y1 = ($items | ForEach-Object { $_.Y + $_.H } | Measure-Object -Maximum).Maximum
-                $gap = 0
-            }
-            $w = $x1 - $x0
-            $hh = $y1 - $y0
-            $col1 = $col0 - $baseCol + 1
-            if ($col1 -gt $maxCol) { $maxCol = $col1 }
-            $out.Add([pscustomobject]@{
-                    Row        = [int]$r.Name
-                    Col        = $col1
-                    X          = $x0
-                    Y          = $y0
-                    W          = $w
-                    H          = $hh
-                    XRel       = [Math]::Round($x0 / $ImageWidth, 4)
-                    YRel       = [Math]::Round($y0 / $ImageHeight, 4)
-                    WRel       = [Math]::Round($w / $ImageWidth, 4)
-                    HRel       = [Math]::Round($hh / $ImageHeight, 4)
-                    GapPrev    = $gap
-                    GapPrevRel = [Math]::Round($gap / $ImageWidth, 4)
-                    InBlockX   = 0
-                    InBlockY   = 0
-                })
-        }
-    }
-    $sorted = @($out | Sort-Object Row, Col)
-
-    return [pscustomobject]@{
-        BlockId = $Grid.BlockId
-        Rows    = $(if ($sorted.Count -gt 0) { ($sorted | Measure-Object Row -Maximum).Maximum } else { 0 })
-        Cols    = $maxCol
-        Cells   = $sorted
-    }
-}
-
-#
-# 注意：不同行的符号数可以不同（6/8/5 …），所以「列」不是全局网格列，
-# 而是**行内序号**；需要判断是否对齐时用 XRel/YRel（相对整屏的归一化位置）。
+# 纯网格扫描：符号全部对齐固定网格，中心点直接由公式算出，不做任何墨迹推断。
+#   格中心 X = CellW/2 + n × CellW
+#   格中心 Y = CellW/2 + m × RowPitch
+#   裁剪框   = 中心 ± Half（所有符号同一尺寸）
+# 1080p 基准：CellW=80、RowPitch=120、Half=34（即 4K 的 160 / 240 / 68）
 function Get-BlockGrid {
     param(
         $LumBuf, $Block, [double]$Scale = 1.0,
-        [int]$InkThreshold = 90,
-        [int]$RowMinGap = 2, [int]$RowMergeGap = 8,
-        [int]$SymMinGap = 10, [int]$SymMinRun = 4
+        [int]$InkThreshold = 30, [double]$MinInkRatio = 0.005
     )
     $s = { param([double]$v) [Math]::Max(1, [int][Math]::Round($v * $Scale)) }
-
-    $sub = [pscustomobject]@{
-        Lum    = [MtGV5.QuickOps]::CropLum($LumBuf.Lum, $LumBuf.Width, $LumBuf.Height, $Block.X, $Block.Y, $Block.W, $Block.H)
-        Width  = $Block.W
-        Height = $Block.H
-    }
-
-    # 块内残留的分隔线先抹掉（块边界本身已在线外侧，但抗锯齿可能有残留）
-    Remove-SeparatorLines -LumBuf $sub -MaxThickness (& $s 6) | Out-Null
-
-    $layout = @(Get-RowLayout -LumBuf $sub -Threshold $InkThreshold -MinGap (& $s $RowMinGap) -RowMergeGap (& $s $RowMergeGap))
-    $glyphRows = @($layout | Where-Object { $_.Kind -eq 'glyph' })
-
+    $cellW = & $s 80
+    $rowPitch = & $s 120
+    $half = & $s 34
     $imgW = $LumBuf.Width
     $imgH = $LumBuf.Height
+    $side = $half * 2
+    $minInk = [int][Math]::Max(8, [Math]::Round($side * $side * $MinInkRatio))
+
+    $raw = [MtGV7.GridScan]::Scan($LumBuf.Lum, $imgW, $imgH, $cellW, $rowPitch, $half,
+        $InkThreshold, $Block.X, $Block.Y, $Block.W, $Block.H, $minInk)
+
     $cells = New-Object System.Collections.Generic.List[object]
+    $rowMap = @{}
     $rowIdx = 0
-    foreach ($gr in $glyphRows) {
-        $rowIdx++
-        $bandH = $gr.Y1 - $gr.Y0 + 1
-        $symRuns = @(Get-InkColumnRuns -LumBuf $sub -X0 0 -Y0 $gr.Y0 -W $Block.W -H $bandH `
-                -Threshold $InkThreshold -MinGap (& $s $SymMinGap) -MinRun (& $s $SymMinRun))
-        $colIdx = 0
-        $prevRight = $null
-        foreach ($sr in $symRuns) {
-            $bb = Get-InkBounds -LumBuf $sub -X0 $sr.X -Y0 $gr.Y0 -W $sr.W -H $bandH -Threshold $InkThreshold
-            if ($null -eq $bb) { continue }
-            $colIdx++
-            $gx = $Block.X + $bb.X
-            $gy = $Block.Y + $bb.Y
-            # 与前一个符号的横向间距：纯机械事实，用来区分「同一组笔划」与「不同符号」
-            $gapPrev = if ($null -eq $prevRight) { 0 } elseif ($gx -gt $prevRight) { $gx - $prevRight } else { 0 }
-            $prevRight = $gx + $bb.W
-            $cells.Add([pscustomobject]@{
-                    Row        = $rowIdx
-                    Col        = $colIdx
-                    X          = $gx
-                    Y          = $gy
-                    W          = $bb.W
-                    H          = $bb.H
-                    XRel       = [Math]::Round($gx / $imgW, 4)
-                    YRel       = [Math]::Round($gy / $imgH, 4)
-                    WRel       = [Math]::Round($bb.W / $imgW, 4)
-                    HRel       = [Math]::Round($bb.H / $imgH, 4)
-                    GapPrev    = $gapPrev
-                    GapPrevRel = [Math]::Round($gapPrev / $imgW, 4)
-                    InBlockX   = $bb.X
-                    InBlockY   = $bb.Y
-                })
-        }
+    $maxCol = 0
+    for ($i = 0; $i -lt $raw.Length; $i += 7) {
+        $m = $raw[$i]; $x0 = $raw[$i + 2]; $y0 = $raw[$i + 3]
+        $cw = $raw[$i + 4]; $ch = $raw[$i + 5]
+        if (-not $rowMap.ContainsKey($m)) { $rowIdx++; $rowMap[$m] = @{ Row = $rowIdx; Count = 0 } }
+        $rowMap[$m].Count++
+        $colIdx = $rowMap[$m].Count
+        if ($colIdx -gt $maxCol) { $maxCol = $colIdx }
+        $cells.Add([pscustomobject]@{
+                Row        = $rowMap[$m].Row
+                Col        = $colIdx
+                GridCol    = $raw[$i + 1]
+                X          = $x0
+                Y          = $y0
+                W          = $cw
+                H          = $ch
+                XRel       = [Math]::Round($x0 / $imgW, 4)
+                YRel       = [Math]::Round($y0 / $imgH, 4)
+                WRel       = [Math]::Round($cw / $imgW, 4)
+                HRel       = [Math]::Round($ch / $imgH, 4)
+                CropX      = $x0
+                CropY      = $y0
+                CropW      = $cw
+                CropH      = $ch
+                InkW       = 0
+                InkH       = 0
+                InkX       = 0
+                InkY       = 0
+                GapPrev    = 0
+                GapPrevRel = 0
+                RowCenterY = $y0 + $ch / 2.0
+                InBlockX   = $x0 - $Block.X
+                InBlockY   = $y0 - $Block.Y
+            })
     }
 
     return [pscustomobject]@{
         BlockId = $Block.BlockId
         Rows    = $rowIdx
-        Cols    = $(if ($cells.Count -gt 0) { ($cells | Measure-Object -Property Col -Maximum).Maximum } else { 0 })
+        Cols    = $maxCol
         Cells   = $cells
     }
 }

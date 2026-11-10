@@ -8,8 +8,11 @@
 
 . (Join-Path $PSScriptRoot '..\vision\common.ps1')
 
-$script:DistanceHighConf = 0.08 * 255     # 0-1 尺度的阈值换算到 0-255
-$script:DistanceMax = 0.11 * 255
+# 阈值实测（4K，固定网格格 + 亮度归一化）：
+#   同形（含灰/白同形、跨块同形）≤ 0.014；异形最近对（加/减镜像）= 0.0775
+#   取 0.045 / 0.060 留出余量：宁可多分（后续可 Merge），不要误并
+$script:DistanceHighConf = 0.045 * 255     # 0-1 尺度的阈值换算到 0-255
+$script:DistanceMax = 0.060 * 255
 
 function New-GlyphBook {
     param([string]$Path, [int]$Dim = 24)

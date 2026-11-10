@@ -8,6 +8,7 @@
 #   click_at(块,行,列)   点格子（含空位）
 #   click_at_rel(块,x,y) 点块内相对位置（0-1），用于没有符号的空槽位
 #   click_symbol(id)     点某个符号最近一次出现的位置
+#   set_translation()    给符号写游戏内译文（剪贴板粘贴；空文本 = 清除）
 #   game_state()         running / closed / minimized / not-foreground
 #   start_game()         通过 Steam 启动并等到窗口出现
 #   merge_symbols / split_symbol  台账纠错
@@ -115,28 +116,27 @@ function Get-GameObservation {
             $grids[$b.BlockId] = Get-BlockGrid -LumBuf $lb -Block $b -Scale $scale
         }
 
-        # 全页推断网格（格宽 / 列偏移），然后把同一行内同一列的笔划合并成一个符号。
-        # 不合并的话 III 会被拆成 3 个 I——因为笔画间距小于格宽。
-        $metrics = $null
-        $allCells = @($grids.Values | ForEach-Object { $_.Cells })
-        if ($allCells.Count -gt 0) {
-            $metrics = Get-CellMetrics -Cells $allCells -ImageWidth $lb.Width
-        }
-        if ($metrics) {
-            foreach ($b in $blocks) {
-                $grids[$b.BlockId] = Merge-CellsByGrid -Grid $grids[$b.BlockId] -Metrics $metrics `
-                    -BlockX $b.X -ImageWidth $lb.Width -ImageHeight $lb.Height
-            }
-        }
-
         # 结构签名：块矩形 + 网格尺寸 + 每格指纹哈希。
         # 必须包含格子内容，否则「同一位置换了符号」会被误判成无变化。
         $vecs = @{}
         $sigParts = foreach ($b in $blocks) {
             $g = $grids[$b.BlockId]
             $hashes = foreach ($cell in $g.Cells) {
+                # 采样用固定内缩后的裁剪框（Crop*）：格子 160 内缩 12 → 136，正好贴住符号边
                 $vec = [MtGV5.QuickOps]::SampleVec($lb.Lum, $lb.Width, $lb.Height,
-                    $cell.X, $cell.Y, $cell.W, $cell.H, $api.SampleSize)
+                    $cell.CropX, $cell.CropY, $cell.CropW, $cell.CropH, $api.SampleSize)
+                # 亮度归一化：灰色条目（max≈130）与白色条目（max≈255）应是同一符号，
+                # 把向量线性缩放到 max=255，指纹就与色调无关（色调另由 Tone 字段表达）
+                $maxV = 0
+                foreach ($v in $vec) { if ($v -gt $maxV) { $maxV = $v } }
+                if ($maxV -gt 20 -and $maxV -lt 250) {
+                    $k = 255.0 / $maxV
+                    for ($vi = 0; $vi -lt $vec.Length; $vi++) {
+                        $nvv = [int][Math]::Round($vec[$vi] * $k)
+                        if ($nvv -gt 255) { $nvv = 255 }
+                        $vec[$vi] = [byte]$nvv
+                    }
+                }
                 $key = '{0}:{1}:{2}' -f $b.BlockId, $cell.Row, $cell.Col
                 $vecs[$key] = $vec
                 # 轻量校验和（避免大整数溢出问题），足以判断「这一格是否变了」
@@ -174,18 +174,26 @@ function Get-GameObservation {
             foreach ($cell in $g.Cells) {
                 $key = '{0}:{1}:{2}' -f $b.BlockId, $cell.Row, $cell.Col
                 [byte[]]$vec = $vecs[$key]
-                $aspect = $cell.W / [double]$cell.H
+                # 固定裁剪后所有符号同尺寸，宽高比不再作为身份特征
+                $aspect = 0
                 $m = Find-GlyphId -Book $api.Book -Vec $vec -Aspect $aspect
                 $cell | Add-Member -NotePropertyName SymbolId -NotePropertyValue $m.Id -Force
                 $cell | Add-Member -NotePropertyName Band -NotePropertyValue $m.Band -Force
                 $cell | Add-Member -NotePropertyName Distance -NotePropertyValue $m.Distance -Force
+                # 白/灰判定：裁剪框内墨迹平均亮度（白 ≈ 231，灰 ≈ 109）
+                $toneStats = [MtGV6.InkTone]::CellStats($lb.Lum, $lb.Width, $lb.Height,
+                    $cell.CropX, $cell.CropY, $cell.CropW, $cell.CropH, 60)
+                $tone = 'none'
+                if ($toneStats[0] -gt 8) { $tone = $(if ($toneStats[1] -ge 170) { 'white' } else { 'gray' }) }
+                $cell | Add-Member -NotePropertyName Tone -NotePropertyValue $tone -Force
+                $cell | Add-Member -NotePropertyName InkLum -NotePropertyValue ([Math]::Round($toneStats[1], 1)) -Force
 
                 $isNew = Add-GlyphSample -Book $api.Book -Id $m.Id -Vec $vec -Aspect $aspect
                 if ($isNew) {
                     $symDir = Join-Path $api.OutDir 'symbols'
                     New-Item -ItemType Directory -Path $symDir -Force | Out-Null
                     $symPath = Join-Path $symDir ($m.Id + '.png')
-                    $rect = [System.Drawing.Rectangle]::new($cell.X, $cell.Y, $cell.W, $cell.H)
+                    $rect = [System.Drawing.Rectangle]::new($cell.CropX, $cell.CropY, $cell.CropW, $cell.CropH)
                     $crop = $frame.Bitmap.Clone($rect, $frame.Bitmap.PixelFormat)
                     $crop.Save($symPath, [System.Drawing.Imaging.ImageFormat]::Png)
                     $crop.Dispose()
@@ -246,10 +254,8 @@ function Get-GameObservation {
             $rowIdx = 0
             if ($inside.Count -gt 0) { $rowIdx = $inside[0].Row }
             $colIdx = 0
-            if ($null -ne $metrics) {
-                $baseCol = [int][Math]::Round(($hostBlk.X - $metrics.Offset) / $metrics.CellW)
-                $colIdx = ([int][Math]::Round(($cx - $metrics.Offset) / $metrics.CellW)) - $baseCol + 1
-            }
+            $gCellW = [Math]::Max(1, [int][Math]::Round(80 * $scale))
+            $colIdx = [int][Math]::Floor($cx / $gCellW) - [int][Math]::Floor($hostBlk.X / $gCellW) + 1
             $ids = @()
             foreach ($cc in $inside) { $ids = @($ids) + @([string]$cc.SymbolId) }
 
@@ -295,6 +301,10 @@ function Get-GameBlock {
             SymbolId   = $c.SymbolId
             Band       = $c.Band
             Distance   = $c.Distance
+            Tone       = $c.Tone
+            InkLum     = $c.InkLum
+            InkW       = $c.InkW
+            InkH       = $c.InkH
             XRel       = $c.XRel
             YRel       = $c.YRel
             WRel       = $c.WRel
@@ -391,6 +401,56 @@ function Invoke-GameClickSymbol {
     if (-not $api.CellIndex.ContainsKey($SymbolId)) { throw "该符号本次画面里没出现：$SymbolId" }
     $c = $api.CellIndex[$SymbolId][0]
     return Invoke-GameClickAt -BlockId $c.BlockId -Row $c.Row -Col $c.Col -Button $Button -DryRun:$DryRun
+}
+
+# 给符号写游戏内译文：点符号行的译文栏 → 剪贴板粘贴 → 回车。
+# 游戏机制：译文按符号 ID 全局共享；空文本 = 清除；窗口不在前台时译文不显示，所以必须先切前台。
+function Set-GameTranslation {
+    param(
+        [Parameter(Mandatory)][string]$SymbolId,
+        [AllowEmptyString()][string]$Text = '',
+        [switch]$DryRun
+    )
+    $api = Get-ApiInstance
+    if (-not $api.CellIndex.ContainsKey($SymbolId)) { throw "该符号本次画面里没出现：$SymbolId" }
+    if (-not $api.Win) { throw '还没有窗口几何：先跑一次观察' }
+    $c = $api.CellIndex[$SymbolId][0]
+    $rowCells = @($api.Grids[$c.BlockId].Cells | Where-Object { $_.Row -eq $c.Row })
+    if ($rowCells.Count -eq 0) { throw "行不存在：块 $($c.BlockId) 行 $($c.Row)" }
+    $cell = $rowCells | Where-Object { $_.Col -eq $c.Col } | Select-Object -First 1
+    if (-not $cell) { throw "格不存在：块 $($c.BlockId) 行 $($c.Row) 列 $($c.Col)" }
+
+    # 译文栏在该行格子基线下方：以全行最高格子的底边为准（矮符号的墨迹底边不可靠）
+    $rowBottom = ($rowCells | ForEach-Object { $_.Y + $_.H } | Measure-Object -Maximum).Maximum
+    $scale = $api.Win.Height / 1080.0
+    $ix = $cell.X + [int]($cell.W / 2)
+    $iy = [int]$rowBottom + [int][Math]::Round(26 * $scale)
+    $pt = Convert-ImagePointToScreen -X $ix -Y $iy -Window $api.Win
+
+    if ($DryRun) {
+        Write-Host ("[dry-run] 写译文 {0} = '{1}' @ ({2},{3})" -f $SymbolId, $Text, $pt.X, $pt.Y) -ForegroundColor DarkGray
+        return [pscustomobject]@{ SymbolId = $SymbolId; Text = $Text; X = $pt.X; Y = $pt.Y; DryRun = $true }
+    }
+
+    $null = Set-GameForeground
+    Invoke-Click -X $pt.X -Y $pt.Y -Button Left -SettleMs 250
+    $sh = New-Object -ComObject WScript.Shell
+    Start-Sleep -Milliseconds 150
+    if ($Text.Length -gt 0) {
+        Set-Clipboard -Value $Text
+        Start-Sleep -Milliseconds 80
+        $sh.SendKeys('^v')
+        Start-Sleep -Milliseconds 250
+    }
+    else {
+        $sh.SendKeys('^a')
+        Start-Sleep -Milliseconds 100
+        $sh.SendKeys('{BACKSPACE}')
+        Start-Sleep -Milliseconds 100
+    }
+    $sh.SendKeys('{ENTER}')
+    Start-Sleep -Milliseconds 300
+    return [pscustomobject]@{ SymbolId = $SymbolId; Text = $Text; X = $pt.X; Y = $pt.Y; DryRun = $false }
 }
 
 function Merge-GameSymbols {

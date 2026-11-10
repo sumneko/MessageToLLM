@@ -4,6 +4,10 @@ runs/
 # 符号台账（运行时自动学习，不属于代码）
 data/glyphbook.json
 
+# 游戏进度笔记与本地译文台账（属于游玩进程，不进版本库）
+progress/
+data/translations-s*.json
+
 # 本地配置（可能含 API Key）
 config.json
 
