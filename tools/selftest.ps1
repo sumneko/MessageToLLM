@@ -76,6 +76,32 @@ foreach ($file in ($expected.Keys | Sort-Object)) {
     Check $file $same ("{0} 行" -f $actual.Count)
 }
 
+Write-Host "`n=== 3b. 分辨率缩放回归（1.33x） ===" -ForegroundColor Cyan
+# 像素级阈值必须随画面缩放：把 p1 放大到 4/3 后按对应缩放识别，结果应与 1080 基线完全一致。
+$scaleK = 4.0 / 3.0
+$p1Path = Join-Path $root 'data\samples\p1.png'
+$p1Want = $expected['p1.png']
+$srcBmp = Open-ImagePlain -Path $p1Path
+$upW = [int][Math]::Round($srcBmp.Width * $scaleK)
+$upH = [int][Math]::Round($srcBmp.Height * $scaleK)
+$upBmp = [System.Drawing.Bitmap]::new($upW, $upH, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+$gUp = [System.Drawing.Graphics]::FromImage($upBmp)
+$gUp.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+$gUp.DrawImage($srcBmp, 0, 0, $upW, $upH)
+$gUp.Dispose(); $srcBmp.Dispose()
+$upPath = Join-Path $root 'runs\selftest\p1-x133.png'
+Save-Frame -Bitmap $upBmp -Path $upPath | Out-Null
+$upBmp.Dispose()
+$mUp = Get-PanelMatrix -ImagePath $upPath -Library $lib -Scale $scaleK
+$idsUp = @(Get-MatrixIds -Matrix $mUp | ForEach-Object { ($_ -join ',') })
+$sameUp = ($idsUp.Count -eq $p1Want.Count)
+if ($sameUp) {
+    for ($i = 0; $i -lt $p1Want.Count; $i++) {
+        if ($idsUp[$i] -ne $p1Want[$i]) { $sameUp = $false; Check "p1-x133 r$($i+1)" $false ("期望 $($p1Want[$i]) / 实际 $($idsUp[$i])"); break }
+    }
+}
+Check '放大 1.33x 识别一致' $sameUp ("{0} 行，{1}x{2}" -f $idsUp.Count, $upW, $upH)
+
 Write-Host "`n=== 4. 实时截屏 ===" -ForegroundColor Cyan
 if ($SkipCapture) {
     Write-Host "  [SKIP] 已指定 -SkipCapture" -ForegroundColor DarkGray
@@ -86,13 +112,16 @@ else {
         Write-Host "  [SKIP] 游戏未运行（进程 MessageFromAliens 没有窗口）" -ForegroundColor DarkGray
     }
     else {
-        Check '窗口几何' ($win.Width -gt 0 -and $win.Height -gt 0) ("{0}x{1} @ ({2},{3}) DPI={4}" -f $win.Width, $win.Height, $win.X, $win.Y, $win.Dpi)
+        Check '窗口几何' ($win.Width -gt 0 -and $win.Height -gt 0) ("客户区 {0}x{1} @ ({2},{3}) DPI={4}/{5} 参考缩放={6:N3} 点缩放={7:N3}{8}" -f `
+                $win.Width, $win.Height, $win.X, $win.Y, $win.Dpi, $win.SystemDpi, ($win.Height / 1080.0), $win.PointScale, $(if ($win.HasBorder) { ' 有边框' } else { '' }))
+        $dpiWarn = Get-DpiWarning -Window $win
+        if ($dpiWarn) { Write-Host ("         ⚠ {0}" -f $dpiWarn) -ForegroundColor Yellow }
         $fg = Test-GameForeground
         Write-Host ("         前台? {0} {1}" -f $fg.Ok, $(if ($fg.Ok) { '' } else { "（当前是 $($fg.Foreground.ProcessName)）" })) -ForegroundColor DarkGray
         try {
             # Auto：前台用 GDI，后台用 PrintWindow
             $frame = Capture-GameFrame -Method Auto
-            Check '截屏' $true ("method=$($frame.Method)")
+            Check '截屏' $true ("method=$($frame.Method) 尺寸=$($frame.Bitmap.Width)x$($frame.Bitmap.Height)")
             $outFile = Join-Path $root ("runs\selftest\frame-{0}.png" -f (Get-Date -Format 'HHmmss'))
             Save-Frame -Bitmap $frame.Bitmap -Path $outFile | Out-Null
             Write-Host ("         已保存：{0}" -f $outFile) -ForegroundColor DarkGray

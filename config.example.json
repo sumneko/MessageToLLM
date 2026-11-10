@@ -1,8 +1,8 @@
 {
   "game": {
     "processName": "MessageFromAliens",
-    "expectedWidth": 1920,
-    "expectedHeight": 1080,
+    "referenceWidth": 1920,
+    "referenceHeight": 1080,
     "captureMethod": "Auto"
   },
   "vision": {

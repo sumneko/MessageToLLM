@@ -10,6 +10,300 @@ try {
     Add-Type -AssemblyName System.Drawing.Common -ErrorAction Stop
 }
 
+# ---------------------------------------------------------------- 热路径的 C# 实现
+#
+# 逐像素扫描在 PowerShell 里是解释执行的：4K 全屏（830 万像素）一次亮度表就要 900ms，
+# 行/列投影、剥分隔线再各接近 1s。这些全是机械运算、没有语义，下沉到 C# 后降到毫秒级。
+# 注意：Add-Type 的类型不能在同一会话重复定义，改了定义要换命名空间。
+if (-not ([System.Management.Automation.PSTypeName]'MtGV5.QuickOps').Type) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+namespace MtGV5 {
+    public class QuickOps {
+        // 32bpp BGRA 缓冲 → 亮度表
+        public static byte[] Lum(byte[] buf, int w, int h, int stride) {
+            byte[] lum = new byte[w * h];
+            for (int y = 0; y < h; y++) {
+                int rowOff = y * stride;
+                int lumOff = y * w;
+                for (int x = 0; x < w; x++) {
+                    int i = rowOff + x * 4;
+                    lum[lumOff + x] = (byte)(0.114 * buf[i] + 0.587 * buf[i + 1] + 0.299 * buf[i + 2]);
+                }
+            }
+            return lum;
+        }
+
+        public static int[] RowProfile(byte[] lum, int w, int h, int threshold) {
+            int[] prof = new int[h];
+            for (int y = 0; y < h; y++) {
+                int off = y * w;
+                int c = 0;
+                for (int x = 0; x < w; x++) { if (lum[off + x] >= threshold) c++; }
+                prof[y] = c;
+            }
+            return prof;
+        }
+
+        // 区域内每列墨迹数（长度 w，索引为相对 x0 的偏移）
+        public static int[] ColProfile(byte[] lum, int imgW, int x0, int y0, int w, int h, int threshold) {
+            int[] prof = new int[w];
+            for (int y = y0; y < y0 + h; y++) {
+                int off = y * imgW;
+                for (int x = x0; x < x0 + w; x++) { if (lum[off + x] >= threshold) prof[x - x0]++; }
+            }
+            return prof;
+        }
+
+        // 裁出子亮度表（矩形裁剪，用于分块）
+        public static byte[] CropLum(byte[] lum, int imgW, int imgH, int x0, int y0, int w, int h) {
+            if (x0 < 0) { w += x0; x0 = 0; }
+            if (y0 < 0) { h += y0; y0 = 0; }
+            if (x0 + w > imgW) { w = imgW - x0; }
+            if (y0 + h > imgH) { h = imgH - y0; }
+            if (w <= 0) { w = 1; }
+            if (h <= 0) { h = 1; }
+            byte[] dst = new byte[w * h];
+            for (int y = 0; y < h; y++) {
+                int srcOff = (y0 + y) * imgW + x0;
+                int dstOff = y * w;
+                for (int x = 0; x < w; x++) { dst[dstOff + x] = lum[srcOff + x]; }
+            }
+            return dst;
+        }
+
+        // 剥隔离线，返回 [已剥行数, 已剥列数]
+        public static int[] RemoveSeparators(byte[] lum, int w, int h, int threshold, double coverage, int maxThickness) {
+            int killedRows = 0, killedCols = 0;
+
+            double[] rowCov = new double[h];
+            for (int y = 0; y < h; y++) {
+                int off = y * w;
+                int c = 0;
+                for (int x = 0; x < w; x++) { if (lum[off + x] >= threshold) c++; }
+                rowCov[y] = (double)c / w;
+            }
+            int yy = 0;
+            while (yy < h) {
+                if (rowCov[yy] >= coverage) {
+                    int y0 = yy;
+                    while (yy < h && rowCov[yy] >= coverage) yy++;
+                    int y1 = yy - 1;
+                    bool okAbove = (y0 == 0) || (rowCov[y0 - 1] < 0.5);
+                    bool okBelow = (y1 == h - 1) || (rowCov[y1 + 1] < 0.5);
+                    if ((yy - y0) <= maxThickness && okAbove && okBelow) {
+                        for (int y2 = y0; y2 <= y1; y2++) {
+                            int off = y2 * w;
+                            for (int x = 0; x < w; x++) { lum[off + x] = 0; }
+                        }
+                        killedRows += (y1 - y0 + 1);
+                    }
+                } else { yy++; }
+            }
+
+            double[] colCov = new double[w];
+            for (int x = 0; x < w; x++) {
+                int c = 0;
+                for (int y = 0; y < h; y++) { if (lum[y * w + x] >= threshold) c++; }
+                colCov[x] = (double)c / h;
+            }
+            int xx = 0;
+            while (xx < w) {
+                if (colCov[xx] >= coverage) {
+                    int x0 = xx;
+                    while (xx < w && colCov[xx] >= coverage) xx++;
+                    int x1 = xx - 1;
+                    bool okLeft = (x0 == 0) || (colCov[x0 - 1] < 0.5);
+                    bool okRight = (x1 == w - 1) || (colCov[x1 + 1] < 0.5);
+                    if ((xx - x0) <= maxThickness && okLeft && okRight) {
+                        for (int x2 = x0; x2 <= x1; x2++) {
+                            for (int y = 0; y < h; y++) { lum[y * w + x2] = 0; }
+                        }
+                        killedCols += (x1 - x0 + 1);
+                    }
+                } else { xx++; }
+            }
+
+            return new int[] { killedRows, killedCols };
+        }
+
+        // 存活判定统计，返回 [亮像素数, 颜色桶数]
+        public static int[] InkStats(byte[] buf, int w, int h, int stride, int step, int lumThreshold) {
+            int ink = 0;
+            System.Collections.Generic.HashSet<int> colors = new System.Collections.Generic.HashSet<int>();
+            for (int y = 0; y < h; y += step) {
+                int rowOff = y * stride;
+                for (int x = 0; x < w; x += step) {
+                    int i = rowOff + x * 4;
+                    int b = buf[i], g = buf[i + 1], r = buf[i + 2];
+                    if ((0.114 * b + 0.587 * g + 0.299 * r) >= lumThreshold) ink++;
+                    colors.Add(((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4));
+                }
+            }
+            return new int[] { ink, colors.Count };
+        }
+
+        // 区块归一化采样：把 (x,y,bw,bh) 缩成 n×n，块内取最大值（细线不会被漏掉）
+        public static byte[] SampleVec(byte[] lum, int w, int h, int x, int y, int bw, int bh, int n) {
+            byte[] v = new byte[n * n];
+            if (bw <= 0) { bw = 1; }
+            if (bh <= 0) { bh = 1; }
+            for (int j = 0; j < n; j++) {
+                int by0 = y + (int)((long)j * bh / n);
+                int by1 = y + (int)((long)(j + 1) * bh / n) - 1;
+                if (by1 < by0) { by1 = by0; }
+                if (by0 < 0) { by0 = 0; }
+                if (by1 >= h) { by1 = h - 1; }
+                for (int i = 0; i < n; i++) {
+                    int bx0 = x + (int)((long)i * bw / n);
+                    int bx1 = x + (int)((long)(i + 1) * bw / n) - 1;
+                    if (bx1 < bx0) { bx1 = bx0; }
+                    if (bx0 < 0) { bx0 = 0; }
+                    if (bx1 >= w) { bx1 = w - 1; }
+                    int mx = 0;
+                    for (int yy = by0; yy <= by1; yy++) {
+                        int off = yy * w;
+                        for (int xx = bx0; xx <= bx1; xx++) {
+                            int val = lum[off + xx];
+                            if (val > mx) { mx = val; }
+                        }
+                    }
+                    v[j * n + i] = (byte)mx;
+                }
+            }
+            return v;
+        }
+
+        // 找槽位方框：先找横/竖「线段带」，再配对成闭合矩形。
+        // 返回平铺的 [x0,y0,x1,y1] 四元组（外框）。
+        public static int[] FindFrames(byte[] lum, int w, int h, int threshold, int minLen, int maxThick, int tol) {
+            List<int[]> hBands = FindBands(lum, w, h, threshold, minLen, true, maxThick, tol);
+            List<int[]> vBands = FindBands(lum, w, h, threshold, minLen, false, maxThick, tol);
+            List<int> outv = new List<int>();
+
+            for (int i = 0; i < hBands.Count; i++) {
+                for (int j = i + 1; j < hBands.Count; j++) {
+                    int[] a = hBands[i];   // [y0,y1,x0,x1]
+                    int[] b = hBands[j];
+                    if (Math.Abs(a[2] - b[2]) > tol || Math.Abs(a[3] - b[3]) > tol) { continue; }
+                    int topY = Math.Min(a[1], b[1]);
+                    int botY = Math.Max(a[0], b[0]);
+                    if (botY - topY < minLen) { continue; }
+                    int lx = Math.Min(a[2], b[2]);
+                    int rx = Math.Max(a[3], b[3]);
+                    // 找左右两条竖线
+                    int leftX = -1, rightX = -1;
+                    for (int k = 0; k < vBands.Count; k++) {
+                        int[] v = vBands[k];   // [x0,x1,y0,y1]
+                        if (Math.Abs(v[2] - topY) > tol * 2 || Math.Abs(v[3] - botY) > tol * 2) { continue; }
+                        if (Math.Abs(v[0] - lx) <= tol * 2 && Math.Abs(v[1] - lx) <= tol * 2) { leftX = v[0]; }
+                        if (Math.Abs(v[0] - rx) <= tol * 2 && Math.Abs(v[1] - rx) <= tol * 2) { rightX = v[0]; }
+                    }
+                    if (leftX >= 0 && rightX >= 0 && rightX > leftX) {
+                        outv.Add(lx); outv.Add(topY); outv.Add(rx); outv.Add(botY);
+                    }
+                }
+            }
+            return outv.ToArray();
+        }
+
+        // 线段带：horizontal=true 时返回 [y0,y1,x0,x1]，否则 [x0,x1,y0,y1]
+        static List<int[]> FindBands(byte[] lum, int w, int h, int threshold, int minLen,
+            bool horizontal, int maxThick, int tol) {
+            List<int[]> runs = new List<int[]>();
+            if (horizontal) {
+                for (int y = 0; y < h; y++) {
+                    int x = 0;
+                    while (x < w) {
+                        if (lum[y * w + x] >= threshold) {
+                            int s = x;
+                            while (x < w && lum[y * w + x] >= threshold) { x++; }
+                            if (x - s >= minLen) { runs.Add(new int[] { y, s, x - 1 }); }
+                        }
+                        else { x++; }
+                    }
+                }
+            }
+            else {
+                for (int x = 0; x < w; x++) {
+                    int y = 0;
+                    while (y < h) {
+                        if (lum[y * w + x] >= threshold) {
+                            int s = y;
+                            while (y < h && lum[y * w + x] >= threshold) { y++; }
+                            if (y - s >= minLen) { runs.Add(new int[] { x, s, y - 1 }); }
+                        }
+                        else { y++; }
+                    }
+                }
+            }
+
+            List<int[]> bands = new List<int[]>();
+            // 按固定坐标排序后合并相邻行/列（x 范围相近）
+            runs.Sort(delegate (int[] p, int[] q) {
+                if (p[0] != q[0]) { return p[0].CompareTo(q[0]); }
+                return p[1].CompareTo(q[1]);
+            });
+            foreach (int[] r in runs) {
+                bool merged = false;
+                for (int i = bands.Count - 1; i >= 0; i--) {
+                    int[] b = bands[i];
+                    if (r[0] - b[1] > 2) { continue; }
+                    if (Math.Abs(b[2] - r[1]) <= tol && Math.Abs(b[3] - r[2]) <= tol) {
+                        b[1] = Math.Max(b[1], r[0]);
+                        merged = true;
+                        break;
+                    }
+                }
+                if (!merged) { bands.Add(new int[] { r[0], r[0], r[1], r[2] }); }
+            }
+
+            List<int[]> keeper = new List<int[]>();
+            foreach (int[] b in bands) {
+                if (b[1] - b[0] + 1 <= maxThick) { keeper.Add(b); }
+            }
+            return keeper;
+        }
+
+        // 台账：在平铺的向量库里找最近邻
+        // lib = count*dim 的字节数组，返回 [bestIndex, bestDist, secondDist]（dist 为 0-255 尺度的 RMS）
+        public static double[] Nearest(byte[] lib, int count, int dim, byte[] vec) {
+            double best = double.MaxValue, second = double.MaxValue;
+            int bestIdx = -1;
+            for (int c = 0; c < count; c++) {
+                int off = c * dim;
+                double sum = 0.0;
+                for (int i = 0; i < dim; i++) {
+                    double d = lib[off + i] - vec[i];
+                    sum += d * d;
+                }
+                double dist = Math.Sqrt(sum / dim);
+                if (dist < best) { second = best; best = dist; bestIdx = c; }
+                else if (dist < second) { second = dist; }
+            }
+            return new double[] { bestIdx, best, second };
+        }
+
+        // 帧差统计，返回 [变化像素数, 采样总数]
+        public static long[] DiffStats(byte[] a, byte[] b, int w, int h, int stride, int step, int tolerance) {
+            long diff = 0, total = 0;
+            for (int y = 0; y < h; y += step) {
+                int rowOff = y * stride;
+                for (int x = 0; x < w; x += step) {
+                    int i = rowOff + x * 4;
+                    total++;
+                    int d = Math.Abs(a[i] - b[i]) + Math.Abs(a[i + 1] - b[i + 1]) + Math.Abs(a[i + 2] - b[i + 2]);
+                    if (d > tolerance) diff++;
+                }
+            }
+            return new long[] { diff, total };
+        }
+    }
+}
+'@ -ErrorAction Stop
+}
+
 # ---------------------------------------------------------------- 读图
 
 function Open-ImagePlain {
@@ -43,21 +337,8 @@ function Get-PixelBuffer {
 # 预计算亮度表（0-255），后面所有判定都基于它
 function Get-LumBuffer {
     param($PB)
-    $w = $PB.Width
-    $h = $PB.Height
-    $buf = $PB.Buf
-    $stride = $PB.Stride
-    $lum = [byte[]]::new($w * $h)
-    for ($y = 0; $y -lt $h; $y++) {
-        $rowOff = $y * $stride
-        $lumOff = $y * $w
-        for ($x = 0; $x -lt $w; $x++) {
-            $i = $rowOff + $x * 4
-            # BGRA
-            $lum[$lumOff + $x] = [byte](0.114 * $buf[$i] + 0.587 * $buf[$i + 1] + 0.299 * $buf[$i + 2])
-        }
-    }
-    return [pscustomobject]@{ Lum = $lum; Width = $w; Height = $h }
+    $lum = [MtGV5.QuickOps]::Lum($PB.Buf, $PB.Width, $PB.Height, $PB.Stride)
+    return [pscustomobject]@{ Lum = $lum; Width = $PB.Width; Height = $PB.Height }
 }
 
 # ---------------------------------------------------------------- 墨迹包围盒
@@ -91,18 +372,14 @@ function Get-InkColumnRuns {
         [int]$Threshold = 90, [int]$MinGap = 3, [int]$MinRun = 6)
     $imgW = $LumBuf.Width
     $imgH = $LumBuf.Height
-    $prof = [int[]]::new($W)
     $yEnd = [Math]::Min($Y0 + $H, $imgH)
     $xEnd = [Math]::Min($X0 + $W, $imgW)
-    for ($y = [Math]::Max(0, $Y0); $y -lt $yEnd; $y++) {
-        $rowOff = $y * $imgW
-        for ($x = [Math]::Max(0, $X0); $x -lt $xEnd; $x++) {
-            if ($LumBuf.Lum[$rowOff + $x] -ge $Threshold) { $prof[$x - $X0]++ }
-        }
-    }
+    $x0 = [Math]::Max(0, $X0)
+    $y0 = [Math]::Max(0, $Y0)
+    $prof = [MtGV5.QuickOps]::ColProfile($LumBuf.Lum, $imgW, $x0, $y0, ($xEnd - $x0), ($yEnd - $y0), $Threshold)
     $runs = New-Object System.Collections.Generic.List[object]
     $inRun = $false; $start = 0; $lastInk = -1
-    for ($x = 0; $x -lt $W; $x++) {
+    for ($x = 0; $x -lt $prof.Length; $x++) {
         if ($prof[$x] -gt 0) {
             if (-not $inRun) { $inRun = $true; $start = $x }
             $lastInk = $x
@@ -110,13 +387,13 @@ function Get-InkColumnRuns {
             if (($x - $lastInk) -ge $MinGap) {
                 $inRun = $false
                 $rw = $lastInk - $start + 1
-                if ($rw -ge $MinRun) { $runs.Add([pscustomobject]@{ X = $X0 + $start; W = $rw }) }
+                if ($rw -ge $MinRun) { $runs.Add([pscustomobject]@{ X = $x0 + $start; W = $rw }) }
             }
         }
     }
     if ($inRun) {
         $rw = $lastInk - $start + 1
-        if ($rw -ge $MinRun) { $runs.Add([pscustomobject]@{ X = $X0 + $start; W = $rw }) }
+        if ($rw -ge $MinRun) { $runs.Add([pscustomobject]@{ X = $x0 + $start; W = $rw }) }
     }
     return $runs
 }
@@ -127,15 +404,7 @@ function Get-InkRowBands {
     param($LumBuf, [int]$Threshold = 90, [int]$MinGap = 2, [int]$MinBand = 4)
     $w = $LumBuf.Width
     $h = $LumBuf.Height
-    $prof = [int[]]::new($h)
-    for ($y = 0; $y -lt $h; $y++) {
-        $rowOff = $y * $w
-        $c = 0
-        for ($x = 0; $x -lt $w; $x++) {
-            if ($LumBuf.Lum[$rowOff + $x] -ge $Threshold) { $c++ }
-        }
-        $prof[$y] = $c
-    }
+    $prof = [MtGV5.QuickOps]::RowProfile($LumBuf.Lum, $w, $h, $Threshold)
     $bands = New-Object System.Collections.Generic.List[object]
     $inBand = $false; $start = 0; $lastInk = -1
     for ($y = 0; $y -lt $h; $y++) {
@@ -204,6 +473,47 @@ function Get-GlyphRowBands {
     return $out
 }
 
+# ---------------------------------------------------------------- 自适应分块
+
+# 按「列方向低密度带」把整页切成若干块（左栏 / 右栏 / 侧边按钮区）。
+# 竖线剥完常有抗锯齿残点，所以判据不是「零墨迹」，而是「该列亮像素占比 ≤ MaxDensity」。
+# MinGap 必须按画面缩放传入：1920 下约 40px，4K 下 80px，才不会被符号间隙误切。
+function Get-LumBlocks {
+    param($LumBuf, [int]$MinGap = 40, [double]$MaxDensity = 0.02, [int]$Threshold = 90)
+    $w = $LumBuf.Width
+    $h = $LumBuf.Height
+    if ($w -le 0 -or $h -le 0) { return @() }
+    $counts = [MtGV5.QuickOps]::ColProfile($LumBuf.Lum, $w, 0, 0, $w, $h, $Threshold)
+    $limit = [Math]::Max(1, [int]($h * $MaxDensity))
+
+    $blocks = New-Object System.Collections.Generic.List[object]
+    $cur = 0
+    $x = 0
+    while ($x -lt $w) {
+        if ($counts[$x] -le $limit) {
+            $gapStart = $x
+            while ($x -lt $w -and $counts[$x] -le $limit) { $x++ }
+            if (($x - $gapStart) -ge $MinGap -and $gapStart -gt $cur) {
+                $blocks.Add([pscustomobject]@{ X0 = $cur; W = ($gapStart - $cur) })
+                $cur = $x
+            }
+        }
+        else { $x++ }
+    }
+    if ($cur -lt $w) { $blocks.Add([pscustomobject]@{ X0 = $cur; W = ($w - $cur) }) }
+
+    # 收紧到实际墨迹列，避免块尾空白把最后一格的包围盒撑大
+    $tight = New-Object System.Collections.Generic.List[object]
+    foreach ($b in $blocks) {
+        $x0 = $b.X0
+        $x1 = $b.X0 + $b.W - 1
+        while ($x0 -le $x1 -and $counts[$x0] -le $limit) { $x0++ }
+        while ($x1 -ge $x0 -and $counts[$x1] -le $limit) { $x1-- }
+        if ($x1 -ge $x0) { $tight.Add([pscustomobject]@{ X0 = $x0; W = ($x1 - $x0 + 1) }) }
+    }
+    return $tight
+}
+
 # ---------------------------------------------------------------- 剥掉分隔线
 
 # 截图边缘经常带进游戏的细长分隔线。它们会：
@@ -212,70 +522,8 @@ function Get-GlyphRowBands {
 # 字形不可能有 45% 以上的整行/整列覆盖，所以不会误伤。
 function Remove-SeparatorLines {
     param($LumBuf, [int]$Thresh = 25, [double]$Coverage = 0.90, [int]$MaxThickness = 6)
-    $w = $LumBuf.Width
-    $h = $LumBuf.Height
-    $lum = $LumBuf.Lum
-    $rowTarget = [int]($Coverage * $w)
-    $colTarget = [int]($Coverage * $h)
-    $killedRows = 0
-    $killedCols = 0
-
-    # ---- 水平线
-    $rowCov = [double[]]::new($h)
-    for ($y = 0; $y -lt $h; $y++) {
-        $off = $y * $w
-        $c = 0
-        for ($x = 0; $x -lt $w; $x++) {
-            if ($lum[$off + $x] -ge $Thresh) { $c++ }
-        }
-        $rowCov[$y] = $c / $w
-    }
-    $y = 0
-    while ($y -lt $h) {
-        if ($rowCov[$y] -ge $Coverage) {
-            $y0 = $y
-            while ($y -lt $h -and $rowCov[$y] -ge $Coverage) { $y++ }
-            $y1 = $y - 1
-            # 隔离校验：上下邻行不能也很密集（否则是字形本身的密集行）
-            $okAbove = ($y0 -eq 0) -or ($rowCov[$y0 - 1] -lt 0.5)
-            $okBelow = ($y1 -eq $h - 1) -or ($rowCov[$y1 + 1] -lt 0.5)
-            if (($y - $y0) -le $MaxThickness -and $okAbove -and $okBelow) {
-                for ($yy = $y0; $yy -le $y1; $yy++) {
-                    $off = $yy * $w
-                    for ($x = 0; $x -lt $w; $x++) { $lum[$off + $x] = 0 }
-                }
-                $killedRows += ($y1 - $y0 + 1)
-            }
-        } else { $y++ }
-    }
-
-    # ---- 垂直线
-    $colCov = [double[]]::new($w)
-    for ($x = 0; $x -lt $w; $x++) {
-        $c = 0
-        for ($y = 0; $y -lt $h; $y++) {
-            if ($lum[$y * $w + $x] -ge $Thresh) { $c++ }
-        }
-        $colCov[$x] = $c / $h
-    }
-    $x = 0
-    while ($x -lt $w) {
-        if ($colCov[$x] -ge $Coverage) {
-            $x0 = $x
-            while ($x -lt $w -and $colCov[$x] -ge $Coverage) { $x++ }
-            $x1 = $x - 1
-            $okLeft = ($x0 -eq 0) -or ($colCov[$x0 - 1] -lt 0.5)
-            $okRight = ($x1 -eq $w - 1) -or ($colCov[$x1 + 1] -lt 0.5)
-            if (($x - $x0) -le $MaxThickness -and $okLeft -and $okRight) {
-                for ($xx = $x0; $xx -le $x1; $xx++) {
-                    for ($y = 0; $y -lt $h; $y++) { $lum[$y * $w + $xx] = 0 }
-                }
-                $killedCols += ($x1 - $x0 + 1)
-            }
-        } else { $x++ }
-    }
-
-    return [pscustomobject]@{ Rows = $killedRows; Cols = $killedCols }
+    $r = [MtGV5.QuickOps]::RemoveSeparators($LumBuf.Lum, $LumBuf.Width, $LumBuf.Height, $Thresh, $Coverage, $MaxThickness)
+    return [pscustomobject]@{ Rows = $r[0]; Cols = $r[1] }
 }
 
 # 行布局：把图形行和它下面那行文字配成对。游戏里两者都是对齐到同一网格的。

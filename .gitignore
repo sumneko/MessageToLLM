@@ -1,6 +1,9 @@
 # 运行时产物
 runs/
 
+# 符号台账（运行时自动学习，不属于代码）
+data/glyphbook.json
+
 # 本地配置（可能含 API Key）
 config.json
 

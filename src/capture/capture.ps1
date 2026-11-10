@@ -5,23 +5,28 @@
 
 . (Join-Path $PSScriptRoot '..\vision\common.ps1')
 
-if (-not ([System.Management.Automation.PSTypeName]'MtL2.Native').Type) {
+if (-not ([System.Management.Automation.PSTypeName]'MtL4.Native').Type) {
     Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
-namespace MtL2 {
-    [StructLayout(LayoutKind.Sequential)]
-    public struct RECT { public int Left, Top, Right, Bottom; }
+namespace MtL4 {
+    [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+    [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
 
     public class Native {
         [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+        [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr hWnd, out RECT rect);
+        [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr hWnd, ref POINT pt);
         [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
         [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
         [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
         [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
         [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, IntPtr extra);
         [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr hWnd);
+        [DllImport("user32.dll")] public static extern uint GetDpiForSystem();
         [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint flags);
+        [DllImport("user32.dll", SetLastError = true)] public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+        [DllImport("user32.dll")] public static extern int GetSystemMetrics(int index);
     }
 }
 '@ -ErrorAction Stop
@@ -29,34 +34,76 @@ namespace MtL2 {
 
 $script:MOUSEEVENTF_LEFTDOWN = 0x0002
 $script:MOUSEEVENTF_LEFTUP = 0x0004
+$script:MOUSEEVENTF_RIGHTDOWN = 0x0008
+$script:MOUSEEVENTF_RIGHTUP = 0x0010
+$script:DPI_AWARENESS_INIT = $null
+
+# 尝试把进程提升到 PER_MONITOR_AWARE_V2（-4）。
+# 成功 => 所有窗口/截屏/鼠标 API 都用物理像素；失败 => 可能已被主程序 manifest 锁定。
+# 真正的换算判据不看返回值，而是 Get-GameWindow 里的 PointScale。
+function Initialize-DpiAwareness {
+    if ($null -ne $script:DPI_AWARENESS_INIT) { return $script:DPI_AWARENESS_INIT }
+    $script:DPI_AWARENESS_INIT = [MtL4.Native]::SetProcessDpiAwarenessContext([IntPtr](-4))
+    return $script:DPI_AWARENESS_INIT
+}
+
+# 点源即尝试一次（越早越可能成功；失败也不影响，靠 PointScale 适配）
+Initialize-DpiAwareness | Out-Null
 
 # 找到游戏窗口并返回几何信息；找不到返回 $null
+#
+# X / Y / Width / Height 是「客户区」的屏幕位置与尺寸 —— 截屏和点击都用它，
+# 这样无论无边框全屏、有边框窗口还是 4K 缩放，都不需要额外的偏移补偿。
 function Get-GameWindow {
     param([string]$ProcessName = 'MessageFromAliens')
     $proc = Get-Process -Name $ProcessName -ErrorAction SilentlyContinue |
         Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
     if (-not $proc) { return $null }
 
-    $rect = New-Object MtL2.RECT
-    if (-not [MtL2.Native]::GetWindowRect($proc.MainWindowHandle, [ref]$rect)) { return $null }
+    $wr = New-Object MtL4.RECT
+    if (-not [MtL4.Native]::GetWindowRect($proc.MainWindowHandle, [ref]$wr)) { return $null }
+    $cr = New-Object MtL4.RECT
+    if (-not [MtL4.Native]::GetClientRect($proc.MainWindowHandle, [ref]$cr)) { return $null }
+    $pt = New-Object MtL4.POINT
+    $pt.X = 0; $pt.Y = 0
+    [void][MtL4.Native]::ClientToScreen($proc.MainWindowHandle, [ref]$pt)
+
+    $winW = $wr.Right - $wr.Left
+    $winH = $wr.Bottom - $wr.Top
+    $cliW = $cr.Right - $cr.Left
+    $cliH = $cr.Bottom - $cr.Top
+
+    # 坐标虚拟化判据：窗口 DPI / 系统 DPI。
+    #   已 aware: 窗口 DPI 144 / 系统 DPI 144 = 1     => 坐标即物理像素
+    #   unaware : 窗口 DPI 144 / 系统 DPI 96  = 1.5   => SetCursorPos 需要物理像素，点前乘 1.5
+    $dpiWin = [MtL4.Native]::GetDpiForWindow($proc.MainWindowHandle)
+    $dpiSys = [MtL4.Native]::GetDpiForSystem()
+    $pointScale = if ($dpiSys -gt 0 -and $dpiWin -gt 0) { [double]$dpiWin / [double]$dpiSys } else { 1.0 }
 
     return [pscustomobject]@{
-        ProcessName = $proc.ProcessName
-        Pid         = $proc.Id
-        Handle      = $proc.MainWindowHandle
-        X           = $rect.Left
-        Y           = $rect.Top
-        Width       = ($rect.Right - $rect.Left)
-        Height      = ($rect.Bottom - $rect.Top)
-        Dpi         = [MtL2.Native]::GetDpiForWindow($proc.MainWindowHandle)
+        ProcessName    = $proc.ProcessName
+        Pid            = $proc.Id
+        Handle         = $proc.MainWindowHandle
+        X              = $pt.X                # 客户区屏幕原点
+        Y              = $pt.Y
+        Width          = $cliW                # 客户区尺寸
+        Height         = $cliH
+        WindowX        = $wr.Left
+        WindowY        = $wr.Top
+        WindowWidth    = $winW
+        WindowHeight   = $winH
+        HasBorder      = (($winW -ne $cliW) -or ($winH -ne $cliH) -or ($wr.Left -ne $pt.X) -or ($wr.Top -ne $pt.Y))
+        Dpi            = $dpiWin
+        SystemDpi      = $dpiSys
+        PointScale     = [Math]::Round($pointScale, 4)   # 截图/客户区坐标 → SetCursorPos 物理像素
     }
 }
 
 # 当前前台窗口是谁
 function Get-ForegroundInfo {
-    $h = [MtL2.Native]::GetForegroundWindow()
+    $h = [MtL4.Native]::GetForegroundWindow()
     $fgPid = [uint32]0
-    [void][MtL2.Native]::GetWindowThreadProcessId($h, [ref]$fgPid)
+    [void][MtL4.Native]::GetWindowThreadProcessId($h, [ref]$fgPid)
     $name = "PID $fgPid"
     try { $name = (Get-Process -Id $fgPid -ErrorAction Stop).ProcessName } catch { }
     return [pscustomobject]@{ Handle = $h; Pid = $fgPid; ProcessName = $name }
@@ -81,28 +128,21 @@ function Test-GameForeground {
 function Test-FrameAlive {
     param(
         [System.Drawing.Bitmap]$Bitmap,
-        [int]$MinInkPixels = 400,        # 亮度≥60 的像素数下限（全屏 2M 像素，正常画面约 1-3 万）
+        [int]$MinInkPixels = 400,        # 1920x1080 下的下限（全屏 2M 像素，正常画面约 1-3 万），按面积等比缩放
         [int]$MinDistinctColors = 4,
-        [int]$Step = 4
+        [int]$Step = 4,
+        [int]$ReferenceHeight = 1080
     )
+    # 4K 下像素数是 4 倍，阈值与采样步长都跟着缩放，否则阈值偏高、耗时翻倍
+    $scale = $Bitmap.Height / $ReferenceHeight
+    if ($scale -le 0) { $scale = 1.0 }
+    $minInk = [int]($MinInkPixels * $scale * $scale)
+    $step = [Math]::Max(1, [int][Math]::Round($Step * $scale))
+
     $pb = Get-PixelBuffer -Bmp $Bitmap
-    $buf = $pb.Buf
-    $stride = $pb.Stride
-    $w = $pb.Width
-    $h = $pb.Height
-    $ink = 0
-    $colors = New-Object System.Collections.Generic.HashSet[int]
-    for ($y = 0; $y -lt $h; $y += $Step) {
-        $rowOff = $y * $stride
-        for ($x = 0; $x -lt $w; $x += $Step) {
-            $i = $rowOff + $x * 4
-            $b = $buf[$i]; $g = $buf[$i + 1]; $r = $buf[$i + 2]
-            if ((0.114 * $b + 0.587 * $g + 0.299 * $r) -ge 60) { $ink++ }
-            $null = $colors.Add((($r -shr 4) -shl 8) -bor (($g -shr 4) -shl 4) -bor ($b -shr 4))
-        }
-    }
-    if ($colors.Count -lt $MinDistinctColors) { return $false }
-    return ($ink -ge $MinInkPixels)
+    $st = [MtGV5.QuickOps]::InkStats($pb.Buf, $pb.Width, $pb.Height, $pb.Stride, $step, 60)
+    if ($st[1] -lt $MinDistinctColors) { return $false }
+    return ($st[0] -ge $minInk)
 }
 
 # 截取游戏窗口当前帧。失败一律 throw CAPTURE_FAIL:...
@@ -150,12 +190,12 @@ function Capture-GameFrame {
         $used = 'GDI'
     }
     else {
-        # 后台截屏：向窗口索取渲染内容
-        $bmp = [System.Drawing.Bitmap]::new($win.Width, $win.Height, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+        # 后台截屏：向窗口索取渲染内容（PrintWindow 只能整窗，有边框时再裁到客户区）
+        $bmp = [System.Drawing.Bitmap]::new($win.WindowWidth, $win.WindowHeight, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
         $g = [System.Drawing.Graphics]::FromImage($bmp)
         $hdc = $g.GetHdc()
         try {
-            $ok = [MtL2.Native]::PrintWindow($win.Handle, $hdc, 2)   # 2 = PW_RENDERFULLCONTENT
+            $ok = [MtL4.Native]::PrintWindow($win.Handle, $hdc, 2)   # 2 = PW_RENDERFULLCONTENT
         }
         finally {
             $g.ReleaseHdc($hdc)
@@ -165,6 +205,19 @@ function Capture-GameFrame {
         if (-not $ok) {
             $bmp.Dispose()
             throw "CAPTURE_FAIL: PrintWindow 调用失败（窗口可能拒绝渲染）"
+        }
+        if ($win.HasBorder) {
+            $ox = $win.X - $win.WindowX
+            $oy = $win.Y - $win.WindowY
+            $cw = [Math]::Min($win.Width, $win.WindowWidth - $ox)
+            $ch = [Math]::Min($win.Height, $win.WindowHeight - $oy)
+            if ($cw -le 0 -or $ch -le 0) {
+                $bmp.Dispose()
+                throw "CAPTURE_FAIL: 客户区几何异常（$cw x $ch）"
+            }
+            $crop = $bmp.Clone([System.Drawing.Rectangle]::new($ox, $oy, $cw, $ch), $bmp.PixelFormat)
+            $bmp.Dispose()
+            $bmp = $crop
         }
     }
 
@@ -181,6 +234,7 @@ function Capture-GameFrame {
         Window       = $win
         Method       = $used
         InForeground = $inFront
+        Scale        = $bmp.Height / 1080.0    # 参考空间（1920x1080）→ 截图像素的倍数
     }
 }
 

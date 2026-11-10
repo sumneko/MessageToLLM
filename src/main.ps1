@@ -51,7 +51,9 @@ if ($Live) {
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $target = Join-Path $OutDir "$stamp\frame-0001.png"
     Save-Frame -Bitmap $frame.Bitmap -Path $target | Out-Null
-    Write-Host ("窗口 {0}x{1} @ ({2},{3})  DPI={4}" -f $frame.Window.Width, $frame.Window.Height, $frame.Window.X, $frame.Window.Y, $frame.Window.Dpi)
+    Write-Host ("窗口 {0}x{1} @ ({2},{3})  DPI={4}/{5}  参考缩放={6:N3}  点缩放={7:N3}" -f $frame.Window.Width, $frame.Window.Height, $frame.Window.X, $frame.Window.Y, $frame.Window.Dpi, $frame.Window.SystemDpi, $frame.Scale, $frame.Window.PointScale)
+    $dpiWarn = Get-DpiWarning -Window $frame.Window
+    if ($dpiWarn) { Write-Host $dpiWarn -ForegroundColor Yellow }
     $frame.Bitmap.Dispose()
     Write-Host ("已保存首帧：{0}" -f $target) -ForegroundColor DarkGray
 }
@@ -62,7 +64,9 @@ if (-not $target) {
 }
 
 try {
-    $matrix = Get-PanelMatrix -ImagePath $target -Library $library
+    # -Live 时按实时窗口的缩放显式传入；离线图片交给 Get-PanelMatrix 自动判断
+    $scaleArg = if ($null -ne $frame) { $frame.Scale } else { 0 }
+    $matrix = Get-PanelMatrix -ImagePath $target -Library $library -Scale $scaleArg
 }
 catch {
     Write-Host ("识别失败：{0}" -f $_.Exception.Message) -ForegroundColor Red

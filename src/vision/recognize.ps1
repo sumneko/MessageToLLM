@@ -13,16 +13,26 @@ function Get-PanelMatrix {
         [int]$InkThreshold = 90,
         [int]$LabelMinGap = 8,
         [int]$RowMergeGap = 8,
-        [int]$SampleSize = 24
+        [int]$SampleSize = 24,
+        [double]$Scale = 0,            # 0 = 按画面高度自动推算
+        [int]$ReferenceHeight = 1080
     )
     $bmp = Open-ImagePlain -Path $ImagePath
     try {
+        # 所有「像素级」阈值都必须随画面一起缩放：
+        # 1920 下 8px 的字缝在 2K 下是 11px、4K 下是 16px，不缩放会把一个词切成多个标签。
+        # 只有整屏截图才有统一的参考缩放；裁剪过的样张无从得知它被缩放过，保持 1:1。
+        if ($Scale -le 0) {
+            $Scale = if ($bmp.Height -ge 720 -and $bmp.Width -ge 1280) { $bmp.Height / $ReferenceHeight } else { 1.0 }
+        }
+        $s = { param([double]$v) [Math]::Max(1, [int][Math]::Round($v * $Scale)) }
+
         $pb = Get-PixelBuffer -Bmp $bmp
         $lb = Get-LumBuffer -PB $pb
-        Remove-SeparatorLines -LumBuf $lb | Out-Null
+        Remove-SeparatorLines -LumBuf $lb -MaxThickness (& $s 6) | Out-Null
         $W = $bmp.Width
 
-        $layout = @(Get-RowLayout -LumBuf $lb -Threshold $InkThreshold -MinGap 2 -RowMergeGap $RowMergeGap)
+        $layout = @(Get-RowLayout -LumBuf $lb -Threshold $InkThreshold -MinGap (& $s 2) -RowMergeGap (& $s $RowMergeGap))
         $glyphRows = @($layout | Where-Object { $_.Kind -eq 'glyph' })
 
         $rows = New-Object System.Collections.Generic.List[object]
@@ -38,7 +48,7 @@ function Get-PanelMatrix {
             if ($gr.TextIndex -ge 0) {
                 $tb = $layout[$gr.TextIndex]
                 $labelRuns = @(Get-InkColumnRuns -LumBuf $lb -X0 0 -Y0 $tb.Y0 -W $W `
-                        -H ($tb.Y1 - $tb.Y0 + 1) -Threshold $InkThreshold -MinGap $LabelMinGap -MinRun 3)
+                        -H ($tb.Y1 - $tb.Y0 + 1) -Threshold $InkThreshold -MinGap (& $s $LabelMinGap) -MinRun (& $s 3))
                 foreach ($r in $labelRuns) { $centers += ($r.X + $r.W / 2.0) }
             }
             if ($centers.Count -eq 0) { continue }   # 测验页等无标签页面：P0 暂不支持
@@ -69,6 +79,7 @@ function Get-PanelMatrix {
             Image  = (Split-Path $ImagePath -Leaf)
             Width  = $W
             Height = $bmp.Height
+            Scale  = [Math]::Round($Scale, 4)
             Rows   = $rows
         }
     }
