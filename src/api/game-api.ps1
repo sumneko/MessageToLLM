@@ -9,6 +9,8 @@
 #   click_at_rel(块,x,y) 点块内相对位置（0-1），用于没有符号的空槽位
 #   click_symbol(id)     点某个符号最近一次出现的位置
 #   set_translation()    给符号写游戏内译文（剪贴板粘贴；空文本 = 清除）
+#   get_translation()    读符号当前的游戏内译文（点译文栏 → Ctrl+A/C → Esc）
+#   sync_translations()  把整页所有符号的译文读下来，写回本地台账 json
 #   game_state()         running / closed / minimized / not-foreground
 #   start_game()         通过 Steam 启动并等到窗口出现
 #   merge_symbols / split_symbol  台账纠错
@@ -294,22 +296,25 @@ function Get-GameBlock {
     $api = Get-ApiInstance
     if (-not $api.Grids.ContainsKey($BlockId)) { throw "块不存在：$BlockId（先跑一次观察）" }
     $g = $api.Grids[$BlockId]
+    $trans = Import-GameTranslationMap
     $cells = foreach ($c in $g.Cells) {
+        $t = if ($trans.ContainsKey($c.SymbolId)) { $trans[$c.SymbolId] } else { $null }
         [pscustomobject]@{
-            Row        = $c.Row
-            Col        = $c.Col
-            SymbolId   = $c.SymbolId
-            Band       = $c.Band
-            Distance   = $c.Distance
-            Tone       = $c.Tone
-            InkLum     = $c.InkLum
-            InkW       = $c.InkW
-            InkH       = $c.InkH
-            XRel       = $c.XRel
-            YRel       = $c.YRel
-            WRel       = $c.WRel
-            HRel       = $c.HRel
-            GapPrevRel = $c.GapPrevRel
+            Row         = $c.Row
+            Col         = $c.Col
+            SymbolId    = $c.SymbolId
+            Translation = $t
+            Band        = $c.Band
+            Distance    = $c.Distance
+            Tone        = $c.Tone
+            InkLum      = $c.InkLum
+            InkW        = $c.InkW
+            InkH        = $c.InkH
+            XRel        = $c.XRel
+            YRel        = $c.YRel
+            WRel        = $c.WRel
+            HRel        = $c.HRel
+            GapPrevRel  = $c.GapPrevRel
         }
     }
     return [pscustomobject]@{
@@ -403,8 +408,144 @@ function Invoke-GameClickSymbol {
     return Invoke-GameClickAt -BlockId $c.BlockId -Row $c.Row -Col $c.Col -Button $Button -DryRun:$DryRun
 }
 
-# 给符号写游戏内译文：点符号行的译文栏 → 剪贴板粘贴 → 回车。
-# 游戏机制：译文按符号 ID 全局共享；空文本 = 清除；窗口不在前台时译文不显示，所以必须先切前台。
+# ───────────────────────── 译文读写 ─────────────────────────
+# 游戏把译文渲染在每个符号正下方（默认占位符为半角 '?'）。
+# 读法：点译文栏 → Ctrl+A → Ctrl+C → 读剪贴板 → Esc 退出编辑。
+# 本地台账（data\translations-s.json）只是游戏内译文的镜像，不作真相源。
+
+function Get-GameTranslationPath {
+    param([string]$Path)
+    if ($Path) { return $Path }
+    $api = Get-ApiInstance
+    return (Join-Path $api.Root 'data\translations-s.json')
+}
+
+function Import-GameTranslationMap {
+    param([string]$Path)
+    $p = Get-GameTranslationPath -Path $Path
+    $map = @{}
+    if (Test-Path $p) {
+        try {
+            $json = Get-Content $p -Raw -Encoding UTF8 | ConvertFrom-Json
+            # 值为空串 = 已确认游戏内无译文；键缺失 = 从未同步过
+            foreach ($prop in $json.PSObject.Properties) {
+                $map[$prop.Name] = if ($null -eq $prop.Value) { '' } else { [string]$prop.Value }
+            }
+        }
+        catch { }
+    }
+    return $map
+}
+
+function Save-GameTranslationMap {
+    param([hashtable]$Map, [string]$Path)
+    $p = Get-GameTranslationPath -Path $Path
+    $dir = Split-Path $p -Parent
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $ordered = [ordered]@{}
+    foreach ($k in ($Map.Keys | Sort-Object)) { $ordered[$k] = $Map[$k] }
+    ($ordered | ConvertTo-Json -Depth 4) | Set-Content -Path $p -Encoding UTF8
+    return $p
+}
+
+# 译文栏中心点（参考空间坐标 + 屏幕坐标）
+function Get-TranslationSlotPoint {
+    param([int]$BlockId, [int]$Row, [int]$Col)
+    $api = Get-ApiInstance
+    if (-not $api.Win) { throw '还没有窗口几何：先跑一次观察' }
+    if (-not $api.Grids.ContainsKey($BlockId)) { throw "块不存在：$BlockId" }
+    $rowCells = @($api.Grids[$BlockId].Cells | Where-Object { $_.Row -eq $Row })
+    if ($rowCells.Count -eq 0) { throw "行不存在：块 $BlockId 行 $Row" }
+    $cell = $rowCells | Where-Object { $_.Col -eq $Col } | Select-Object -First 1
+    if (-not $cell) { throw "格不存在：块 $BlockId 行 $Row 列 $Col" }
+    # 以整行最高格子的底边为准（矮符号的墨迹底边不可靠）
+    $rowBottom = ($rowCells | ForEach-Object { $_.Y + $_.H } | Measure-Object -Maximum).Maximum
+    $scale = $api.Win.Height / 1080.0
+    $ix = $cell.X + [int]($cell.W / 2)
+    $iy = [int]$rowBottom + [int][Math]::Round(26 * $scale)
+    return [pscustomobject]@{ X = $ix; Y = $iy; Screen = (Convert-ImagePointToScreen -X $ix -Y $iy -Window $api.Win) }
+}
+
+# 读一个符号当前的游戏内译文；无译文返回空串
+function Get-GameTranslationText {
+    param(
+        [Parameter(Mandatory)][string]$SymbolId,
+        [switch]$DryRun
+    )
+    $api = Get-ApiInstance
+    if (-not $api.CellIndex.ContainsKey($SymbolId)) { throw "该符号本次画面里没出现：$SymbolId" }
+    $c = $api.CellIndex[$SymbolId][0]
+    $slot = Get-TranslationSlotPoint -BlockId $c.BlockId -Row $c.Row -Col $c.Col
+    if ($DryRun) {
+        return [pscustomobject]@{ SymbolId = $SymbolId; Text = $null; SlotX = $slot.X; SlotY = $slot.Y; DryRun = $true }
+    }
+    $null = Set-GameForeground
+    $sh = New-Object -ComObject WScript.Shell
+    $sentinel = [string][char]1 + 'SENTINEL'
+    Set-Clipboard -Value $sentinel
+    Start-Sleep -Milliseconds 60
+    Invoke-Click -X $slot.Screen.X -Y $slot.Screen.Y -Button Left -SettleMs 200
+    Start-Sleep -Milliseconds 120
+    $sh.SendKeys('^a'); Start-Sleep -Milliseconds 110
+    $sh.SendKeys('^c'); Start-Sleep -Milliseconds 200
+    $raw = Get-Clipboard -Raw
+    $sh.SendKeys('{ESC}'); Start-Sleep -Milliseconds 240
+    $text = ''
+    if ($raw -and $raw -ne $sentinel) { $text = ([string]$raw).Replace($sentinel, '').Trim() }
+    if ($text -eq '?' -or $text -eq '？') { $text = '' }
+    return [pscustomobject]@{ SymbolId = $SymbolId; Text = $text; SlotX = $slot.X; SlotY = $slot.Y; DryRun = $false }
+}
+
+# 同步整页译文：逐格读游戏内译文栏，写回本地台账并返回映射
+function Sync-GameTranslations {
+    param(
+        [int[]]$BlockId,
+        [string]$Path,
+        [switch]$OnlyNew,
+        [switch]$PassThru
+    )
+    $api = Get-ApiInstance
+    if (-not $api.Win) { throw '还没有窗口几何：先跑一次观察' }
+    $map = Import-GameTranslationMap -Path $Path
+    $order = @()
+    if ($BlockId) { $order = @($BlockId) }
+    else { $order = @($api.Grids.Keys | Sort-Object) }
+
+    $ids = New-Object System.Collections.Generic.List[string]
+    $seen = @{}
+    foreach ($bid in $order) {
+        if (-not $api.Grids.ContainsKey($bid)) { continue }
+        foreach ($cc in ($api.Grids[$bid].Cells | Sort-Object Row, Col)) {
+            if (-not $seen.ContainsKey($cc.SymbolId)) { $seen[$cc.SymbolId] = $true; $ids.Add($cc.SymbolId) }
+        }
+    }
+
+    $changed = 0
+    $i = 0
+    $read = 0
+    foreach ($id in $ids) {
+        $i++
+        if ($OnlyNew -and $map.ContainsKey($id)) { continue }
+        Write-Progress -Activity '同步游戏内译文' -Status "$id ($i/$($ids.Count))" -PercentComplete (100.0 * $i / [Math]::Max(1, $ids.Count))
+        $r = Get-GameTranslationText -SymbolId $id
+        $read++
+        if ($r.Text) {
+            if (-not $map.ContainsKey($id) -or $map[$id] -ne $r.Text) { $map[$id] = $r.Text; $changed++ }
+        }
+        elseif (-not $map.ContainsKey($id) -or $map[$id] -ne '') {
+            $map[$id] = ''; $changed++
+        }
+    }
+    Write-Progress -Activity '同步游戏内译文' -Completed
+
+    $savedPath = Save-GameTranslationMap -Map $map -Path $Path
+    $known = @($map.Keys | Where-Object { $map[$_] }).Count
+    $out = [pscustomobject]@{ Read = $read; Changed = $changed; Known = $known; Total = $map.Count; Path = $savedPath }
+    if ($PassThru) { $out | Add-Member -NotePropertyName Map -NotePropertyValue $map }
+    return $out
+}
+
+# 写译文：点译文栏 → 清空 → 粘贴 → 回车；同时更新本地台账
 function Set-GameTranslation {
     param(
         [Parameter(Mandatory)][string]$SymbolId,
@@ -413,27 +554,16 @@ function Set-GameTranslation {
     )
     $api = Get-ApiInstance
     if (-not $api.CellIndex.ContainsKey($SymbolId)) { throw "该符号本次画面里没出现：$SymbolId" }
-    if (-not $api.Win) { throw '还没有窗口几何：先跑一次观察' }
     $c = $api.CellIndex[$SymbolId][0]
-    $rowCells = @($api.Grids[$c.BlockId].Cells | Where-Object { $_.Row -eq $c.Row })
-    if ($rowCells.Count -eq 0) { throw "行不存在：块 $($c.BlockId) 行 $($c.Row)" }
-    $cell = $rowCells | Where-Object { $_.Col -eq $c.Col } | Select-Object -First 1
-    if (-not $cell) { throw "格不存在：块 $($c.BlockId) 行 $($c.Row) 列 $($c.Col)" }
-
-    # 译文栏在该行格子基线下方：以全行最高格子的底边为准（矮符号的墨迹底边不可靠）
-    $rowBottom = ($rowCells | ForEach-Object { $_.Y + $_.H } | Measure-Object -Maximum).Maximum
-    $scale = $api.Win.Height / 1080.0
-    $ix = $cell.X + [int]($cell.W / 2)
-    $iy = [int]$rowBottom + [int][Math]::Round(26 * $scale)
-    $pt = Convert-ImagePointToScreen -X $ix -Y $iy -Window $api.Win
+    $slot = Get-TranslationSlotPoint -BlockId $c.BlockId -Row $c.Row -Col $c.Col
 
     if ($DryRun) {
-        Write-Host ("[dry-run] 写译文 {0} = '{1}' @ ({2},{3})" -f $SymbolId, $Text, $pt.X, $pt.Y) -ForegroundColor DarkGray
-        return [pscustomobject]@{ SymbolId = $SymbolId; Text = $Text; X = $pt.X; Y = $pt.Y; DryRun = $true }
+        Write-Host ("[dry-run] 写译文 {0} = '{1}' @ ({2},{3})" -f $SymbolId, $Text, $slot.X, $slot.Y) -ForegroundColor DarkGray
+        return [pscustomobject]@{ SymbolId = $SymbolId; Text = $Text; X = $slot.X; Y = $slot.Y; DryRun = $true }
     }
 
     $null = Set-GameForeground
-    Invoke-Click -X $pt.X -Y $pt.Y -Button Left -SettleMs 250
+    Invoke-Click -X $slot.Screen.X -Y $slot.Screen.Y -Button Left -SettleMs 250
     $sh = New-Object -ComObject WScript.Shell
     Start-Sleep -Milliseconds 150
     if ($Text.Length -gt 0) {
@@ -450,7 +580,13 @@ function Set-GameTranslation {
     }
     $sh.SendKeys('{ENTER}')
     Start-Sleep -Milliseconds 300
-    return [pscustomobject]@{ SymbolId = $SymbolId; Text = $Text; X = $pt.X; Y = $pt.Y; DryRun = $false }
+
+    $map = Import-GameTranslationMap
+    if ($Text.Length -gt 0) { $map[$SymbolId] = $Text }
+    elseif ($map.ContainsKey($SymbolId)) { $map.Remove($SymbolId) }
+    $savedPath = Save-GameTranslationMap -Map $map
+
+    return [pscustomobject]@{ SymbolId = $SymbolId; Text = $Text; X = $slot.X; Y = $slot.Y; DryRun = $false; Book = $savedPath }
 }
 
 function Merge-GameSymbols {

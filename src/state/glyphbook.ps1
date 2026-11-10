@@ -8,11 +8,12 @@
 
 . (Join-Path $PSScriptRoot '..\vision\common.ps1')
 
-# 阈值实测（4K，固定网格格 + 亮度归一化）：
-#   同形（含灰/白同形、跨块同形）≤ 0.014；异形最近对（加/减镜像）= 0.0775
-#   取 0.045 / 0.060 留出余量：宁可多分（后续可 Merge），不要误并
-$script:DistanceHighConf = 0.045 * 255     # 0-1 尺度的阈值换算到 0-255
-$script:DistanceMax = 0.060 * 255
+# 阈值实测（4K，固定网格裁剪 + 亮度归一化）：
+#   同形（含灰/白、跨位置）≤ 0.014；实测异形最近对（加/减镜像）= 0.0775
+#   但同一字形在不同渲染瞬间可能漂移到 0.05~0.06，故 high 取 0.06、max 取 0.072：
+#   既能把同形并稳定，又不跨到 0.0775 的异形对
+$script:DistanceHighConf = 0.060 * 255     # 0-1 尺度的阈值换算到 0-255
+$script:DistanceMax = 0.072 * 255
 
 function New-GlyphBook {
     param([string]$Path, [int]$Dim = 24)
