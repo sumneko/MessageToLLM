@@ -1,6 +1,9 @@
 # 运行时产物
 runs/
 
+# 插件编译产物
+tools/probe-inject/bin/
+
 # 符号台账（运行时自动学习，不属于代码）
 data/glyphbook.json
 

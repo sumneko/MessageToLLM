@@ -30,6 +30,9 @@
 
 # 抓当前游戏画面并识别（前台用 GDI，后台用 PrintWindow）
 .\src\main.ps1 -Live
+
+# 后台点击可行性探针（会让画面变化一次；-HoldClick 抓「按住才显示」的反馈）
+pwsh -NoProfile -File .\tools\probe-bg-input.ps1 -RefX 960 -RefY 540
 ```
 
 自检全绿应输出：`全部通过 ✅`
@@ -107,6 +110,7 @@ runs/                    运行时产物（截图、ID 矩阵、台账、日志�
 | 双屏 | 游戏在哪个屏都行，`CopyFromScreen` 支持副屏坐标 |
 | 后台截屏 | ✅ `PrintWindow(PW_RENDERFULLCONTENT)` 实测可用（4K 下也返回完整帧） |
 | 点击 | ⚠️ 必须前台（`mouse_event` 走桌面输入队列） |
+| 后台点击 | ❌ **实测不可行**。游戏是 Unity（`UnityPlayer.dll`），鼠标走 RawInput。前景 A/B 对照：物理右键某符号（客户区 440,160）→ 左栏变成该符号笔记（帧差 1.81%）；同一时刻 WM 右键另一符号（加伪造 `WM_ACTIVATE`+`WM_SETFOCUS`）→ 帧差 **0.0000%**。左键 `Post`/`Send`/按住模式同样全零。副作用：伪造 `WM_SETFOCUS` 会让游戏把**译文**画出来（游戏靠焦点决定是否显示译文），但输入依旧不通。要「不占电脑」只能把游戏放进 VM / 独立会话 |
 | 动画 | 无 |
 | 数字系统 | 一元竖线计数：`|`=1、`|||`=3、0 是方框内四点 |
 | 分类阈值 | `dist ≤ 0.08` 高置信；`0.08–0.11` 存疑；`> 0.11` 库外新符号 |
