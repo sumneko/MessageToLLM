@@ -133,7 +133,10 @@ pwsh -NoProfile -File .\tools\probe-cmd.ps1 'translate s12345678 hello'
 | `translate <shapeId> <text>` | 主线程定位当前画面的符号，调用其 `AlienCharacter.EndEdit(string)` 提交译文 |
 
 `grid` 提供 `rows`、`cols`、左上格中心、步长和统一符号尺寸。`regions[]` 每项包含 `id`、`cells` 和 `items[]`；`items[]` 按 `shapeId` 去重，每项包含该符号出现位置的 `RrCc` 列表，有译文时附 `translation`（空白和单独 `?` 不返回）。
-`regions[]` 只保留 `AlienCharacter` 所属 GameObject 激活、`SpriteRenderer` 启用且不透明、并被相机判定可见的符号；隐藏进度残留对象不计入区域格数。
+`regions[]` 只保留 `AlienCharacter` 所属 GameObject 激活、`SpriteRenderer` 启用且不透明、并被相机判定可见的符号；隐藏进度残留对象不计入区域格数。`selection.framedPositions` 来自 `Draw.selected` 中闭合且尺寸匹配网格单格的线段，不按颜色判断；空槽框也会作为独立 R/C 位置报告，开放线段不算框。
+`selection.underlinedPositions` / `selection.underlines` 是字符下划线：同样只读 `Draw.selected`，但只认 2 点开放水平线段——长度≈单格宽，y 落在「符号底边再向下 0.42 个符号高」这一行（随 `grid.symbolSize` 缩放，不写死像素），列按线段 x 中点、行按上述行基准映射。`underlinedPositions` 是按行优先的 R/C 列表，`underlines` 是 `[{position, points: [[x,y],[x,y]]}]`（亚像素端点，和 `frames` 的整数框分开）。检测不看颜色，也不按 shapeId 推断同形全部下划线。
+`selection.highlights` 是符号背景高亮：`[{shapeId, positions}]`，逐个实例检查 `AlienCharacter.background` 这个 `SpriteRenderer` 是否真会被画（`enabled`、`activeInHierarchy`、`isVisible`、`color.a > 0.01`），全部满足才把该 R/C 记入。不读 `focused` / `txt.isFocused`（实机证明与高亮无关），也不按 shapeId 推断同形全部高亮：同形可以只有部分实例亮。高亮位置与下划线位置都进入区域比较签名（`|highlight:` / `|underline:`），因此只有背景亮/灭、或只挪下划线而符号、译文、线框不变时也会报 `changedRegions`；线框位置只走 `framedPositions` / `frames`，各字段互不混算。下划线只按「落在某个区域格上」进签名，空白底格（被 `blank` 过滤掉）上的下划线不会单独触发变化。
+`selection.dimmed` 是置灰字符：`[{shapeId, positions}]`，和 `highlights` 同一套聚合逻辑（`BuildShapePositions`，按 shapeId 分组、行优先排序，没命中的形状不出现）。判定来自游戏 `Draw.Write` 的写法——灰字符先把该实例 `sp.color` 设成 `DefaultColor(3)`（front/back 混合色），亮字符是 `DefaultColor(0)`；所以这里把 `sp.color` 与反射缓存的 `Draw.DefaultColor(3)` 比较，RGB 容差 0.01，不写死 RGB 阈值，也不按 shapeId 推断同形全灰。`DefaultColor` 的 `MethodInfo` 只在首次调用时解析并缓存（`_defaultColor`），不逐格反复查找。置灰位置同样进区域签名（`|dimmed:`），只有某个字变灰/变亮而符号、译文、框、高亮、下划线都不变时也会报 `changedRegions`。
 `changes` 仅由显式 `screen` 更新基线；`state` 和 1Hz 快照不会推进基线。`translate` 返回 `submitted` 只表示调用已执行，不保证 UI 已显示；需截图复核。
 
 **不给语义**：没有页面名、没有 `isRiddle/isMenu/...` 这类判定、没有 `sector` 名。区域是什么（标题栏 / 题面 / 候选区 / 菜单）**必须由 LLM 自己从符号和位置推**。

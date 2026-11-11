@@ -1,4 +1,4 @@
-// Plugin.cs —— BepInEx 5 只读探针（第一版：不写任何游戏状态）
+﻿// Plugin.cs —— BepInEx 5 只读探针（第一版：不写任何游戏状态）
 //
 // 由 BepInEx 在主线程加载，Update 里 1Hz 把 Draw 的运行时状态写成 JSON。
 // 只读原则：只读字段、只读集合 Count，不调用任何会改状态的方法。
@@ -28,6 +28,7 @@ namespace MtLProbe
         string _cmdPath;
         string _resultPath;
         List<RegionSnapshot> _lastScreenRegions;
+        MethodInfo _defaultColor;
 
         sealed class RegionSnapshot
         {
@@ -354,6 +355,231 @@ namespace MtLProbe
                 && renderer.isVisible;
         }
 
+        // 下划线在 Draw.selected 里是开放水平线段（2 点，长度≈单格宽），一个字符一条。
+        // 纵向位置是「符号底边再往下 0.42 个符号高」，跟着网格缩放走，不写死像素。
+        const float UnderlineOffsetRatio = 0.42f;
+
+        string BuildSelectionData(int rows, int cols, int firstX, int firstY, int stepX, int stepY, int symbolW, int symbolH,
+            out List<string> underlinedPositions)
+        {
+            IList selected = GV(_draw, "selected") as IList;
+            List<string> positions = new List<string>();
+            List<int[]> boxes = new List<int[]>();
+            List<int[]> underCells = new List<int[]>();
+            List<float[]> underPoints = new List<float[]>();
+            underlinedPositions = new List<string>();
+
+            if (selected != null)
+            {
+                foreach (object value in selected)
+                {
+                    LineRenderer line = value as LineRenderer;
+                    if (line == null || !line.enabled || !line.gameObject.activeInHierarchy || !line.isVisible) continue;
+
+                    List<Vector2> points = new List<Vector2>();
+                    for (int p = 0; p < line.positionCount; p++)
+                    {
+                        Vector3 point = line.GetPosition(p);
+                        if (!line.useWorldSpace) point = line.transform.TransformPoint(point);
+                        Camera cam = Camera.main;
+                        Vector3 screenPoint = cam != null ? cam.WorldToScreenPoint(point) : point;
+                        points.Add(new Vector2(screenPoint.x, Screen.height - screenPoint.y));
+                    }
+
+                    if (line.positionCount == 2)
+                    {
+                        // 开放水平线段：只认长度≈单格宽、落在「符号底边下方固定偏移」这一行的线。
+                        // 全屏分隔线太长、斜线不水平、框是闭合多点，都会被这里挡掉。
+                        Vector2 a = points[0], c = points[1];
+                        if (Math.Abs(a.y - c.y) > symbolH * 0.05f) continue;
+                        float length = Math.Abs(a.x - c.x);
+                        if (length < symbolW * 0.5f || length > symbolW * 1.15f) continue;
+
+                        float midX = (a.x + c.x) / 2f, midY = (a.y + c.y) / 2f;
+                        int ulCol = (int)Math.Round((midX - firstX) / stepX) + 1;
+                        int ulRow = (int)Math.Round((midY - firstY - symbolH / 2f - symbolH * UnderlineOffsetRatio) / stepY) + 1;
+                        if (ulRow < 1 || ulRow > rows || ulCol < 1 || ulCol > cols) continue;
+                        float ulX = firstX + (ulCol - 1) * stepX;
+                        float ulY = firstY + (ulRow - 1) * stepY + symbolH / 2f + symbolH * UnderlineOffsetRatio;
+                        if (Math.Abs(midX - ulX) > stepX * 0.5f || Math.Abs(midY - ulY) > stepY * 0.5f) continue;
+
+                        bool seen = false;
+                        for (int u = 0; u < underCells.Count; u++)
+                        {
+                            if (underCells[u][0] == ulRow && underCells[u][1] == ulCol) { seen = true; break; }
+                        }
+                        if (seen) continue;
+                        underCells.Add(new int[] { ulRow, ulCol });
+                        underPoints.Add(new float[] { a.x, a.y, c.x, c.y });
+                        continue;
+                    }
+
+                    if (line.positionCount < 5) continue;
+                    Vector2 first = points[0], last = points[points.Count - 1];
+                    if (Vector2.Distance(first, last) > 2f) continue;
+
+                    float minX = float.MaxValue, minY = float.MaxValue, maxX = float.MinValue, maxY = float.MinValue;
+                    foreach (Vector2 point in points)
+                    {
+                        if (point.x < minX) minX = point.x;
+                        if (point.x > maxX) maxX = point.x;
+                        if (point.y < minY) minY = point.y;
+                        if (point.y > maxY) maxY = point.y;
+                    }
+                    if (Math.Abs((maxX - minX) - symbolW) > 4f || Math.Abs((maxY - minY) - symbolH) > 4f) continue;
+
+                    bool topLeft = false, topRight = false, bottomLeft = false, bottomRight = false;
+                    foreach (Vector2 point in points)
+                    {
+                        if (Math.Abs(point.x - minX) <= 2f && Math.Abs(point.y - minY) <= 2f) topLeft = true;
+                        if (Math.Abs(point.x - maxX) <= 2f && Math.Abs(point.y - minY) <= 2f) topRight = true;
+                        if (Math.Abs(point.x - minX) <= 2f && Math.Abs(point.y - maxY) <= 2f) bottomLeft = true;
+                        if (Math.Abs(point.x - maxX) <= 2f && Math.Abs(point.y - maxY) <= 2f) bottomRight = true;
+                    }
+                    if (!topLeft || !topRight || !bottomLeft || !bottomRight) continue;
+
+                    float centerX = (minX + maxX) / 2f, centerY = (minY + maxY) / 2f;
+                    int col = (int)Math.Round((centerX - firstX) / stepX) + 1;
+                    int row = (int)Math.Round((centerY - firstY) / stepY) + 1;
+                    if (row < 1 || row > rows || col < 1 || col > cols) continue;
+                    float expectedX = firstX + (col - 1) * stepX;
+                    float expectedY = firstY + (row - 1) * stepY;
+                    if (Math.Abs(centerX - expectedX) > 4f || Math.Abs(centerY - expectedY) > 4f) continue;
+
+                    string position = "R" + row + "C" + col;
+                    if (positions.Contains(position)) continue;
+                    positions.Add(position);
+                    boxes.Add(new int[] { (int)Math.Round(minX), (int)Math.Round(minY),
+                        (int)Math.Round(maxX - minX), (int)Math.Round(maxY - minY) });
+                }
+            }
+
+            StringBuilder b = new StringBuilder("{\"framedPositions\": [");
+            for (int i = 0; i < positions.Count; i++)
+            {
+                if (i > 0) b.Append(", ");
+                b.Append(J(positions[i]));
+            }
+            b.Append("], \"frames\": [");
+            for (int i = 0; i < positions.Count; i++)
+            {
+                if (i > 0) b.Append(", ");
+                int[] box = boxes[i];
+                b.Append("{\"position\": ").Append(J(positions[i]))
+                 .Append(", \"box\": [").Append(box[0]).Append(", ").Append(box[1]).Append(", ")
+                 .Append(box[2]).Append(", ").Append(box[3]).Append("]}");
+            }
+
+            // 下划线：按行优先输出，端点保留亚像素精度；与框、背景高亮分开报。
+            List<int> order = new List<int>();
+            for (int i = 0; i < underCells.Count; i++) order.Add(i);
+            order.Sort(delegate (int x, int y)
+            {
+                int rowCmp = underCells[x][0].CompareTo(underCells[y][0]);
+                return rowCmp != 0 ? rowCmp : underCells[x][1].CompareTo(underCells[y][1]);
+            });
+
+            b.Append("], \"underlinedPositions\": [");
+            for (int i = 0; i < order.Count; i++)
+            {
+                if (i > 0) b.Append(", ");
+                int[] cell = underCells[order[i]];
+                b.Append(J("R" + cell[0] + "C" + cell[1]));
+                underlinedPositions.Add("R" + cell[0] + "C" + cell[1]);
+            }
+            b.Append("], \"underlines\": [");
+            for (int i = 0; i < order.Count; i++)
+            {
+                if (i > 0) b.Append(", ");
+                int[] cell = underCells[order[i]];
+                float[] pts = underPoints[order[i]];
+                b.Append("{\"position\": ").Append(J("R" + cell[0] + "C" + cell[1]))
+                 .Append(", \"points\": [[").Append(N(pts[0])).Append(", ").Append(N(pts[1]))
+                 .Append("], [").Append(N(pts[2])).Append(", ").Append(N(pts[3])).Append("]]}");
+            }
+            b.Append("]}");
+            return b.ToString();
+        }
+
+        static string N(float v)
+        {
+            return v.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture);
+        }
+
+        // 背景高亮：只看该实例自己的 background SpriteRenderer 是否真会被画出来。
+        // 不读 focused / textFocused（实机证明与高亮无关），也不按 shapeId 反推同形全部高亮：
+        // 同形可以只有部分实例高亮。
+        static bool IsBackgroundDrawn(object character)
+        {
+            SpriteRenderer background = GV(character, "background") as SpriteRenderer;
+            if (background == null) return false;
+            if (!background.enabled) return false;
+            if (!background.gameObject.activeInHierarchy) return false;
+            return background.isVisible && background.color.a > 0.01f;
+        }
+
+        // 置灰（第四种状态）：Draw.Write 对灰字符先 Debug.Log("grey")，再把该实例
+        // sp.color 设成自己算的 DefaultColor(3)（front/back 混合色）；亮字符用 DefaultColor(0)=FrontColor。
+        // 这里直接和游戏算出的那只颜色比，不用固定 RGB 阈值，也不按 shapeId 反推同形全灰。
+        bool IsDimmed(object character)
+        {
+            SpriteRenderer sprite = GV(character, "sp") as SpriteRenderer;
+            if (sprite == null || _draw == null) return false;
+            if (_defaultColor == null)
+            {
+                _defaultColor = _draw.GetType().GetMethod("DefaultColor", BF, null, new Type[] { typeof(int) }, null);
+                if (_defaultColor == null) return false;
+            }
+            Color grey = (Color)_defaultColor.Invoke(_draw, new object[] { 3 });
+            Color color = sprite.color;
+            return Math.Abs(color.r - grey.r) <= 0.01f
+                && Math.Abs(color.g - grey.g) <= 0.01f
+                && Math.Abs(color.b - grey.b) <= 0.01f;
+        }
+
+        // 紧凑正式字段：按 shapeId 聚合「实际高亮/实际置灰的实例位置」。没命中的 shape 不出现。
+        string BuildShapePositions(object[,] cell, string[,] shapeIds, bool[,] hit, int rows)
+        {
+            Dictionary<string, List<int[]>> byShape = new Dictionary<string, List<int[]>>();
+            for (int i = 0; i < cell.GetLength(0); i++)
+            {
+                for (int j = 0; j < cell.GetLength(1); j++)
+                {
+                    if (cell[i, j] == null || !hit[i, j]) continue;
+                    List<int[]> positions;
+                    if (!byShape.TryGetValue(shapeIds[i, j], out positions))
+                    {
+                        positions = new List<int[]>();
+                        byShape.Add(shapeIds[i, j], positions);
+                    }
+                    positions.Add(new int[] { i, j });
+                }
+            }
+
+            List<string> ids = new List<string>(byShape.Keys);
+            ids.Sort(StringComparer.Ordinal);
+            StringBuilder b = new StringBuilder("[");
+            for (int k = 0; k < ids.Count; k++)
+            {
+                if (k > 0) b.Append(", ");
+                List<int[]> positions = byShape[ids[k]];
+                positions.Sort(delegate (int[] a, int[] c)
+                {
+                    int rowCmp = (rows - a[1]).CompareTo(rows - c[1]);
+                    return rowCmp != 0 ? rowCmp : a[0].CompareTo(c[0]);
+                });
+                b.Append("{\"shapeId\": ").Append(J(ids[k])).Append(", \"positions\": [");
+                for (int p = 0; p < positions.Count; p++)
+                {
+                    if (p > 0) b.Append(", ");
+                    b.Append(J(CellName(positions[p][0], positions[p][1], rows)));
+                }
+                b.Append("]}");
+            }
+            b.Append("]");
+            return b.ToString();
+        }
+
         // 整屏：按游戏自己的分区分组 → 「有几个区域 + 区域框 + 区域内符号」。
         // 区域代表什么，由 LLM 自己看符号推。
         string BuildScreenData(out List<RegionSnapshot> regionSnapshots)
@@ -373,6 +599,8 @@ namespace MtLProbe
             string[,] shapeIds = new string[nx, ny];
             string[,] translations = new string[nx, ny];
             int[,][] box = new int[nx, ny][];
+            bool[,] backgroundLit = new bool[nx, ny];
+            bool[,] dimmed = new bool[nx, ny];
             int[] symbolSize = null;
             int[] firstCenter = null;
 
@@ -390,6 +618,8 @@ namespace MtLProbe
                     allShapes.Add(sid);
                     cell[i, j] = ac;
                     shapeIds[i, j] = sid;
+                    backgroundLit[i, j] = IsBackgroundDrawn(ac);
+                    dimmed[i, j] = IsDimmed(ac);
                     translations[i, j] = GetTranslationText(ac);
                     box[i, j] = ScreenRect(ac);
                     if (symbolSize == null) symbolSize = new int[] { box[i, j][2], box[i, j][3] };
@@ -403,20 +633,9 @@ namespace MtLProbe
                 }
             }
 
-            b.Append(", \"grid\": {\"rows\": ").Append(ny)
-             .Append(", \"cols\": ").Append(nx)
-             .Append(", \"firstCenter\": ");
-            if (firstCenter == null) b.Append("null");
-            else b.Append("[").Append(firstCenter[0]).Append(", ").Append(firstCenter[1]).Append("]");
-            b
-             .Append(", \"step\": [").Append(pitchX).Append(", ").Append(pitchY).Append("]")
-             .Append(", \"symbolSize\": ");
-            if (symbolSize == null) b.Append("null");
-            else b.Append("[").Append(symbolSize[0]).Append(", ").Append(symbolSize[1]).Append("]");
-            b.Append("}");
-
             // 空格判定：出现次数最多的形状，且占比 ≥ 40% —— 当作「空白底」，不参与分区。
             // 判定结果会写进输出的 blank 字段，LLM 能看到这次把谁当空了。
+            // 先做空格过滤，后面 selection.highlights 才不会被空槽框/底纹污染。
             string blank = null;
             if (allShapes.Count > 0)
             {
@@ -446,6 +665,29 @@ namespace MtLProbe
                     }
                 }
             }
+
+            b.Append(", \"grid\": {\"rows\": ").Append(ny)
+             .Append(", \"cols\": ").Append(nx)
+             .Append(", \"firstCenter\": ");
+            if (firstCenter == null) b.Append("null");
+            else b.Append("[").Append(firstCenter[0]).Append(", ").Append(firstCenter[1]).Append("]");
+            b
+             .Append(", \"step\": [").Append(pitchX).Append(", ").Append(pitchY).Append("]")
+             .Append(", \"symbolSize\": ");
+            if (symbolSize == null) b.Append("null");
+            else b.Append("[").Append(symbolSize[0]).Append(", ").Append(symbolSize[1]).Append("]");
+            b.Append("}");
+            List<string> underlinedPositions = new List<string>();
+            string selectionData;
+            if (firstCenter == null || symbolSize == null)
+                selectionData = "{\"framedPositions\": [], \"frames\": [], \"underlinedPositions\": [], \"underlines\": []}";
+            else
+                selectionData = BuildSelectionData(ny, nx, firstCenter[0], firstCenter[1], pitchX, pitchY, symbolSize[0], symbolSize[1],
+                    out underlinedPositions);
+            selectionData = selectionData.Substring(0, selectionData.Length - 1)
+                + ", \"highlights\": " + BuildShapePositions(cell, shapeIds, backgroundLit, ny)
+                + ", \"dimmed\": " + BuildShapePositions(cell, shapeIds, dimmed, ny) + "}";
+            b.Append(", \"selection\": ").Append(selectionData);
             b.Append(", \"blank\": ").Append(J(blank));
 
             // 按游戏自己的分区分组（AlienCharacter.sector）；分区名不外泄，只给不透明序号 r0/r1/...
@@ -474,6 +716,7 @@ namespace MtLProbe
             });
 
             b.Append(", \"regions\": [");
+            HashSet<string> underlined = new HashSet<string>(underlinedPositions);
             for (int r = 0; r < comps.Count; r++)
             {
                 List<int[]> comp = comps[r];
@@ -495,6 +738,12 @@ namespace MtLProbe
 
                 List<string> ids = new List<string>(byShape.Keys);
                 ids.Sort(StringComparer.Ordinal);
+                // 高亮位置也进签名：背景-only 变化（线框不动、只有背景亮起/熄灭）必须报 changedRegions。
+                // 下划线位置同理：只挪下划线也要报变化。线框在 framedPositions/frames，不进签名；三者绝不混算。
+                // 置灰位置同样进签名：只有某个字变灰/变亮也要报变化。
+                StringBuilder highlightSignature = new StringBuilder();
+                StringBuilder underlineSignature = new StringBuilder();
+                StringBuilder dimmedSignature = new StringBuilder();
                 for (int k = 0; k < ids.Count; k++)
                 {
                     if (k > 0) items.Append(", ");
@@ -514,6 +763,21 @@ namespace MtLProbe
                         string position = CellName(positions[p][0], positions[p][1], ny);
                         regionPositions.Add(position);
                         items.Append(J(position));
+                        if (backgroundLit[positions[p][0], positions[p][1]])
+                        {
+                            if (highlightSignature.Length > 0) highlightSignature.Append(", ");
+                            highlightSignature.Append(J(sid + "@" + position));
+                        }
+                        if (underlined.Contains(position))
+                        {
+                            if (underlineSignature.Length > 0) underlineSignature.Append(", ");
+                            underlineSignature.Append(J(sid + "@" + position));
+                        }
+                        if (dimmed[positions[p][0], positions[p][1]])
+                        {
+                            if (dimmedSignature.Length > 0) dimmedSignature.Append(", ");
+                            dimmedSignature.Append(J(sid + "@" + position));
+                        }
                         string value = translations[positions[p][0], positions[p][1]];
                         if (value != null)
                         {
@@ -527,9 +791,13 @@ namespace MtLProbe
                     items.Append("}");
                 }
 
+                StringBuilder signature = new StringBuilder(items.ToString());
+                if (highlightSignature.Length > 0) signature.Append("|highlight:").Append(highlightSignature);
+                if (underlineSignature.Length > 0) signature.Append("|underline:").Append(underlineSignature);
+                if (dimmedSignature.Length > 0) signature.Append("|dimmed:").Append(dimmedSignature);
                 regionSnapshots.Add(new RegionSnapshot {
                     Id = r,
-                    Signature = items.ToString(),
+                    Signature = signature.ToString(),
                     Positions = regionPositions
                 });
 

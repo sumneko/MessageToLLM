@@ -57,7 +57,10 @@ pwsh -NoProfile -File .\tools\shot.ps1 -Rect 1040,360,80,80 -Scale 4
 | `state` | 立刻重写 `runs\inject\state.json`（后台每 1s 自动写，内容同 `screen`） |
 
 `grid` 提供行列数、左上格中心、横纵格距和统一符号尺寸。行列从左上角起、从 1 编号；`R3C5` 中心坐标按 `firstCenter + [(列-1)*横向步长, (行-1)*纵向步长]` 计算。
-`regions[]` 每项包含区域编号、格数及 `items[]`。`items[]` 按 `shapeId` 去重，每项含该形状在区域内出现的 `positions`（如 `R1C2`）；有已填译文时附 `translation`，空白或单独 `?` 不返回。同一形状在同一区域出现多次时只发送一次指纹。
+`regions[]` 每项包含区域编号、格数及 `items[]`。`items[]` 按 `shapeId` 去重，每项含该形状在区域内出现的 `positions`（如 `R1C2`）；当前闭合方框的位置由顶层 `selection.framedPositions` 返回，`selection.frames` 附像素矩形。有已填译文时附 `translation`，空白或单独 `?` 不返回。同一形状在同一区域出现多次时只发送一次指纹。
+`selection.highlights` 是符号背景高亮：`[{shapeId, positions}]`，只列该实例背景 Renderer 真正可绘制的格（启用、激活、可见、非全透明），不依赖焦点，也不假定同形全部高亮；无高亮时为空数组。高亮不是闭合框，两者字段互不混算。
+`selection.underlinedPositions` / `selection.underlines` 是字符下划线：前者是行优先的 `RrCc` 列表，后者给 `{position, points: [[x,y],[x,y]]}` 端点。来源是 `Draw.selected` 里的开放水平短线（长度≈单格宽、落在符号下方），检测不看颜色，也不假定同形全部带下划线；框、背景高亮、下划线三者字段互不混算，下划线位置同样参与区域差异签名。
+`selection.dimmed` 是置灰字符：`[{shapeId, positions}]`，与 `highlights` 完全同构（数组按 `shapeId` 聚合，没命中的形状不出现）。判定是把该实例 `sp.color` 和游戏自己的 `Draw.DefaultColor(3)`（front/back 混合色）比，容差 0.01，不写死 RGB 阈值，也不假定同形全灰；置灰位置同样参与区域差异签名。框、背景高亮、下划线、置灰四类字段互不混算。
 `changes` 报告新增、变化、消失的区域；第一次 `screen` 只建立基线。后台 `state.json` 快照不会推进基线。
 `translate <shapeId> <text>` 在游戏主线程调用当前画面匹配符号的 `EndEdit(string)`；返回 `submitted` 仅表示提交方法已调用，需通过截图确认译文显示。
 
