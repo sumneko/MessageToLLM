@@ -3,138 +3,144 @@
 让 LLM **自己破解**游戏 *MessageFromAliens* 里的外星符号系统，并通过点击自动完成游戏内的填空题。
 
 > 名字对照：本项目叫 **MessageToLLM**，游戏叫 **MessageFromAliens**（进程名 `MessageFromAliens`）。
+> 协作规则见 `docs/RULES.md`（提问先答复、大改先获批、禁止擅自展开）。
 
-## 当前进度
+## 两条通道，现在用哪条
 
-| 阶段 | 内容 | 状态 |
+| 通道 | 做法 | 状态 |
 |---|---|---|
-| **P0 只读感知** | 截屏 + 网格切分 + 符号分类 + 输出 ID 矩阵 | ✅ **已完成并自检通过** |
-| **P0+ 分辨率自适应** | 1080p / 2K / 4K、125%~200% DPI 缩放下像素参数自动缩放 | ✅ **已完成并自检通过** |
-| **P0++ 接口化** | 分隔线切块 + 块内网格 + 符号台账 + 点击/启游接口 | ✅ **已完成（观察 4K 单页 0.66s，二次观察 0.37s）** |
-| P1 点击原语 | 真实点击 + 帧差验证 | ⏳ 待做 |
-| P2 槽位与配对 | 测验页网格标定、空槽位检测、候选符号区定位 | ⏳ 待做 |
-| P3 算式求解闭环 | 数字/加/减 已知 → 规则求解 → 填满 → 检测「正确」 | ⏳ 待做 |
-| P4 LLM 求解 | 未知符号语义推断 + 动作规划 | ⏳ 待做 |
+| **后台界面接口**（现用） | BepInEx 插件 + 命令文件，进程内读屏、伪造鼠标点击 | ✅ 可用，不需要前台、不抢鼠标 |
+| 前台截屏 + 点击（旧管线） | `src/**` PowerShell 管线：截屏 → 切块 → 指纹 → `mouse_event` 点击 | ✅ 仍能跑，但**必须抢前台**；保留作对照与工具 |
 
-## 快速开始
+游戏是 Unity（`UnityPlayer.dll`，Mono 后端）。实测窗口消息（`PostMessage`/`SendMessage`）注入鼠标**完全无效**（RawInput），所以后台操作只能走进程内钩子 —— 这就是插件存在的理由。
+
+## 快速开始（后台接口）
 
 ```powershell
-# 环境自检（运行时 / 符号库 / 识图回归 / 缩放回归 / 实时截屏 / 点击 dry-run）
-.\tools\selftest.ps1
+# 1) 装插件（BepInEx 5 x64 解压到游戏根目录后执行；-Uninstall 只删插件，-Purge 连 BepInEx 一起清）
+pwsh -NoProfile -File .\tools\build-probe.ps1
 
-# 显示环境诊断（分辨率 / DPI / 窗口客户区 / 点缩放）——换电脑、换屏、点击偏位时先跑它
-.\tools\diagnose-display.ps1
+# 2) 启动游戏
+pwsh -NoProfile -Command ". .\src\api\game-api.ps1; `$null=Initialize-GameApi -Root (Get-Location).Path; Start-Game"
 
-# 识别一张已有截图
+# 3) 看屏幕：几个区域、各区域位置、区域内符号
+pwsh -NoProfile -File .\tools\probe-cmd.ps1 screen
+
+# 4) 点一下（屏幕坐标，左上原点；L 左键 / R 右键）
+pwsh -NoProfile -File .\tools\probe-cmd.ps1 "click 1040 400 L"
+
+# 5) 看某个符号长什么样（坐标取 screen 里的 sp）
+pwsh -NoProfile -File .\tools\shot.ps1 -Rect 1040,360,80,80 -Scale 4
+```
+
+`tools\shot.ps1` 不带 `-Rect` 时输出整帧到 `runs\shot\frame.png`。
+
+## 接口（只做「手和眼」）
+
+| 命令 | 说明 |
+|---|---|
+| `screen` | 整屏快照：`screen`（尺寸）、`blank`（本次判定的空白色）、`regions[]` |
+| `click <x> <y> [L\|R]` | 在屏幕坐标点一下，交给游戏自己的点击逻辑 |
+| `state` | 立刻重写 `runs\inject\state.json`（后台每 1s 自动写，内容同 `screen`） |
+
+`regions[]` 每项：`id`（不透明序号 `r0/r1/...`）、`cells`、`box`（区域框）、`items[]`。
+`items[]` 每项：`x` `y`（网格号）、`shapeId`（形状指纹，同形同 ID、不含词义）、`edge`、`sp`（格子矩形）。
+
+**接口不给语义**：没有页面名、没有题型标记、没有分区名 —— 区域是标题 / 题面 / 候选 / 菜单，要 LLM 自己从符号和位置推。细节（区域怎么来、空格怎么判、坐标规则）见 `docs/INTERNALS.md`。
+
+维护命令（**不属于** solver 接口）：`savedata`（看当前 profile 存档规模）、`resetprofile <n>`（重置某号 profile）。
+
+### 已知的交互协议（实测）
+
+- 点符号 = 左栏变成该符号的笔记（`click <sp 中心> R` 同样效果）
+- 填空 = **先点候选格中心 → 再点答案框中心**，复核答案框 `shapeId` 变成候选的 `shapeId`
+- 坐标必须是格子中心（`sp[0]+sp[2]/2, sp[1]+sp[3]/2`），点边缘/空格无效
+
+## 给求解器
+
+`docs/SOLVER-PROMPT.md` 是给「玩游戏的 LLM」的 system prompt：接口用法、坐标规则、标准循环、失败判定、工具故障停手协议、玩法铁律。
+
+旧的前台管线接口（`Invoke-GameClickAt` / `Get-GameObservation` 等，见 `src/api/game-api.ps1`）仍保留，用于离线识别与对照，不再作为主通道。
+
+```powershell
+# 旧管线：识别一张截图 / 抓当前画面识别
 .\src\main.ps1 -Image data\samples\p1.png
-
-# 抓当前游戏画面并识别（前台用 GDI，后台用 PrintWindow）
 .\src\main.ps1 -Live
 
-# 后台点击可行性探针（会让画面变化一次；-HoldClick 抓「按住才显示」的反馈）
-pwsh -NoProfile -File .\tools\probe-bg-input.ps1 -RefX 960 -RefY 540
+# 环境自检（运行时 / 符号库 / 识图回归 / 缩放回归 / 实时截屏）
+.\tools\selftest.ps1
+.\tools\diagnose-display.ps1   # 分辨率 / DPI / 客户区几何诊断
 ```
-
-自检全绿应输出：`全部通过 ✅`
-
-## 游戏接口（给求解器用）
-
-设计原则：**接口只做「手和眼」，不含任何「这是什么面板 / 这个按钮干什么」的判断**。
-
-| 接口 | 说明 |
-|---|---|
-| `Get-GameObservation` | 截屏 → 分块；结构未变时直接返回 `Changed=$false` |
-| `Get-GameBlock -BlockId` | 块内网格：行/列、符号 ID、置信度、相对位置、与前一个符号的间距；**含槽位（方框 + 框内符号）** |
-| `Get-SymbolInfo -SymbolId` | 台账信息；首次出现时自动存裁剪图 |
-| `Get-SymbolSamples -SymbolId` | 该符号本次出现的位置列表 |
-| `Invoke-GameClickAt -BlockId -Row -Col` | 点某个格子（`-Button Left/Right`） |
-| `Invoke-GameClickAtRel -BlockId -RelX -RelY` | 点块内相对位置（0-1），**空槽位用这个** |
-| `Invoke-GameClickSymbol -SymbolId` | 点该符号最近一次出现的位置 |
-| `Get-GameState` | `running / closed / minimized / not-foreground` |
-| `Start-Game` | 通过 Steam 启动并等到窗口出现 |
-| `Merge-GameSymbols / Split-GameSymbol` | 台账纠错：同形被拆开 / 一个 ID 混了两种形状 |
-
-```powershell
-. .\src\api\game-api.ps1
-$api = Initialize-GameApi -Root (Get-Location).Path
-$obs = Get-GameObservation
-$obs.Blocks | Format-Table BlockId, RelX, RelY, RelW, RelH, Rows, Cols, CellCount
-$null = Get-GameBlock -BlockId 3
-```
-
-判同形由工具用指纹完成（不消耗 LLM 的视觉预算）：
-
-- **网格归并**：先推断格宽（同一行相邻符号中心差的众数 → 用 `画面宽/格宽` 取整修正），再把同一行内同一列的笔画合并成一个符号。
-  不做这步的话 `III` 会被拆成 3 个 `I`。实测：4K 格宽 160（24 列）、1920 格宽 80、1600 宽窗口的裁剪图格宽 ≈66.7。
-- **槽位检测**：细线方框（实测 4K 下 8px 线宽）由「横/竖线段带 + 闭合矩形配对」识别，
-  框边不再当作符号，框内符号归入槽位的 `SymbolIds`。实测：边框剔除后 B4 r3 从 8 个符号降到 3 个。
-- **宽高比**作为辅助身份特征（同形但长宽比例不同的符号需要区分）。
-- LLM 只在 `Band=low/new` 时介入；`Merge/Split` 用于纠正。
 
 ## 目录
 
 ```
+tools/
+  build-probe.ps1        编译并安装只读/界面插件（-Uninstall / -Purge）
+  probe-cmd.ps1          发一条界面命令并打印结果（screen / click / state）
+  shot.ps1               后台截图 + 按 sp 矩形裁图（可放大）
+  dump-asm.ps1           反射枚举游戏托管程序集（类型/方法清单）
+  probe-bg-input.ps1     窗口消息注入可行性探针（结论：不可行）
+  probe-inject/Plugin.cs 插件源码（快照 + 命令通道 + Harmony 输入重定向）
+  selftest.ps1 / diagnose-display.ps1 / ocr-winrt.ps1 / page-dump.ps1 / preview-crops.ps1 / render-observation.ps1
 src/
-  vision/common.ps1      读图 / 亮度表 / 行带 / 网格 / 指纹 / 分隔线剥离 / 列空白带分块
-  vision/layout.ps1      版面切分：分隔线 → 块 → 块内网格（行内列号 + 间距）
-  vision/classify.ps1    指纹 → 已知符号 ID 的最近邻分类（旧回归用）
-  vision/recognize.ps1   旧版「整页 → 标签反推网格」识别（保留作回归基线）
-  state/glyphbook.ps1    符号台账：ID 分配、同形维护、merge / split
-  api/game-api.ps1       **对外游戏接口**（只给「手和眼」，不含任何版面/玩法假设）
+  vision/                读图 / 行带 / 网格 / 指纹 / 分隔线剥离 / 分块
+  state/glyphbook.ps1    符号台账（旧管线）
+  api/game-api.ps1       旧管线对外接口
   capture/capture.ps1    截屏 + 客户区几何 + DPI 换算
-  act/mouse.ps1          点击原语（左/右键）+ 帧差比较
-  main.ps1               调试入口（旧管线）
-  solver/ guard/         预留（P1+ 填充）
-data/
-  clusters.json          43 个符号的 24×24 指纹库（**仅供旧回归测试**）
-  translations.csv       43 条符号译文（**人工 ground truth，不得进 solver 上下文**）
-  glyphbook.json         运行时自动学习的符号台账（gitignore）
-  samples/               样张
+  act/mouse.ps1          点击原语 + 帧差比较（前台）
+  main.ps1               旧管线调试入口
+  solver/ guard/         预留
 docs/
-  HANDOFF.md             完整设计与方案
-  LEXICON.md             符号台账（人工，**仅供回归验证**）
-tools/selftest.ps1       自检 + 识图回归 + 缩放回归
-tools/diagnose-display.ps1  显示器 / DPI / 客户区几何诊断
-runs/                    运行时产物（截图、ID 矩阵、台账、日志），已 gitignore
+  SOLVER-PROMPT.md       给 LLM 的系统提示词
+  INTERNALS.md           游戏内部接口清单 + 插件交付方式 + 维护命令
+  RULES.md               协作规则
+  NOTES.md / HANDOFF.md  历史笔记与完整设计
+  LEGACY-README.md       旧版说明
+runs/                    运行时产物（截图、状态、日志、备份），已 gitignore
 ```
 
-## 已实测的关键事实（可直接依赖）
+## 已实测的关键事实
 
 | 项目 | 值 |
 |---|---|
-| 游戏窗口 | 无边框全屏，客户区一般在 (0,0)；代码一律用**客户区**几何，有边框窗口也能用 |
-| 参考空间 | **1920×1080**（所有像素级阈值以它为准） |
-| 实测可用分辨率 | 1920×1080 / 2560×1440 / 3840×2160 |
-| 分辨率自适应 | `Scale = 客户区高度 / 1080`，字缝、线厚、采样步长按同比例缩放；指纹本身是 24×24 归一化的，不需要重建库 |
-| DPI | `点缩放 = GetDpiForWindow / GetDpiForSystem`：1 = 截图坐标即物理像素；≠1（如 4K@150% 的 unaware 进程 = 1.5）则 `SetCursorPos` 需乘该系数（`ConvertFrom-ReferencePoint` 已处理） |
-| 双屏 | 游戏在哪个屏都行，`CopyFromScreen` 支持副屏坐标 |
-| 后台截屏 | ✅ `PrintWindow(PW_RENDERFULLCONTENT)` 实测可用（4K 下也返回完整帧） |
-| 点击 | ⚠️ 必须前台（`mouse_event` 走桌面输入队列） |
-| 后台点击 | ❌ **实测不可行**。游戏是 Unity（`UnityPlayer.dll`），鼠标走 RawInput。前景 A/B 对照：物理右键某符号（客户区 440,160）→ 左栏变成该符号笔记（帧差 1.81%）；同一时刻 WM 右键另一符号（加伪造 `WM_ACTIVATE`+`WM_SETFOCUS`）→ 帧差 **0.0000%**。左键 `Post`/`Send`/按住模式同样全零。副作用：伪造 `WM_SETFOCUS` 会让游戏把**译文**画出来（游戏靠焦点决定是否显示译文），但输入依旧不通。要「不占电脑」只能把游戏放进 VM / 独立会话 |
-| 动画 | 无 |
-| 数字系统 | 一元竖线计数：`|`=1、`|||`=3、0 是方框内四点 |
-| 分类阈值 | `dist ≤ 0.08` 高置信；`0.08–0.11` 存疑；`> 0.11` 库外新符号 |
+| 游戏引擎 | Unity **6000.6.8f1**，Mono 后端，CLR 4.0.30319 |
+| 游戏窗口 | 无边框全屏 1920×1080，客户区在 (0,0) |
+| 后台截屏 | ✅ `PrintWindow(PW_RENDERFULLCONTENT)` 可用（4K 也完整） |
+| 后台点击 | ✅ 仅插件方案可行：Harmony 改写 `Unity Input` 的鼠标查询 |
+| 窗口消息注入 | ❌ `PostMessage`/`SendMessage`/按住模式全零帧差（RawInput） |
+| 后台 tick | ⚠️ 游戏默认 `runInBackground=false`，失焦即停 `Update`；插件已置 `true` |
+| 屏幕格宽 | 80px（1920 参考空间），网格 24×9 |
+| 形状身份 | `shapeId` = sprite 纹理 FNV-1a 哈希，连续两次快照零差异 |
+| 存档位置 | `LocalLow\Artless Games\MessageFromAliens\76561198086961046\alienmessage<n>.sav`（Steam AutoCloud 目录） |
+| 存档加密 | AES（`CryptoHelper`），`setting.sav` / `*.sav` 都是 base64 密文 |
+| 数字系统 | 一元竖线计数：`|`=1、`|||`=3；0 的写法特殊 |
+| 动画 | 无（同一页静止时帧差 0.0000%） |
 
 ## 已知的坑（别重复踩）
 
-1. **不能用稀疏 `GetPixel` 采样判断黑屏** —— 本游戏笔画极细，隔 40px 采样全落在黑底上，正常画面会被误判为黑屏。必须遍历像素缓冲统计亮像素数。
-2. **`Add-Type` 类型不能二次定义** —— 改了 C# 定义后要换命名空间，否则同一会话报"类型已存在"，而且旧类型会**静默缺少新方法**。当前：采集层 `MtL4.Native`、像素热路径 `MtGV.QuickOps`、诊断 `MtLD.Display`。
-3. **聚类阈值区间很窄** —— 同一符号在不同位置抖动 0.088–0.093，真正不同的符号（菱形上/下横线）距离 0.135–0.208。阈值只能落在 0.11 附近，别随手调。
-4. **列切分必须用文字标签当标尺** —— 符号内部有缝隙（`E̷`/`丰` 这类），按墨迹投影切会把一个符号切成两半。笔记页用标签中心反推网格（4 张图 100% 命中）。
-5. **截图要 PNG 原图** —— JPG 压缩噪点会让指纹抖动。
-6. **像素级阈值不能写死** —— 字间缝隙随分辨率等比变大，`MinGap=8` 在 2K 下会把一个词切成多个标签、网格标尺随之错乱。必须按 `画面高/1080` 等比缩放（`Get-PanelMatrix -Scale`）。
-7. **裁剪过的截图推不出缩放** —— 只有整屏图（≥1280×720）才自动推算 Scale，裁剪样张按 1:1；实时帧由 `-Live` 显式传入。想把裁剪图当 4K 图识别，手动传 `-Scale`。
-8. **逐像素在 PowerShell 里太慢** —— 4K 全屏一次亮度表就要 900ms。热路径已下沉到 `MtGV.QuickOps`，整个识别约 180ms，别改回托管循环。
+1. **改 `ScriptingAssemblies.json` 加载不了自己的程序集** —— Unity 6 真正的脚本程序集名单在 `globalgamemanagers.assets`（二进制）。必须用 BepInEx。
+2. **`GetMouseButtonDown` 必须整帧语义** —— 只给第一个调用者返回 true 会被游戏多组件轮询吃掉，表现为点击只触发「看笔记」、填空无效。
+3. **坐标必须用格子中心** —— 点边缘或空格毫无反应，容易被误判成「填不进去」。
+4. **纹理不可直读** —— `Texture2D.GetPixels32()` 抛异常，要用 `Graphics.Blit` 拷到临时 RT 再读。
+5. **`Object.GetInstanceID()` 在 Unity 6 已废弃（编译报错）** —— 缓存 key 换 `texture.name + textureRect`。
+6. **删存档文件没用** —— Steam 云会把 `alienmessage<n>.sav` 同步回来；要么关云同步，要么用 `resetprofile` 写空档覆盖。
+7. **不能用稀疏 `GetPixel` 判断黑屏** —— 笔画极细，隔 40px 采样全落在黑底。必须遍历像素缓冲。
+8. **`Add-Type` 类型不能二次定义** —— 改 C# 定义要换命名空间，否则旧类型静默缺新方法。
+9. **像素级阈值按分辨率缩放** —— `Scale = 客户区高度 / 1080`，写死会在 2K/4K 上把词切成多个标签。
+10. **列切分要用文字标签当标尺** —— 符号内部有缝隙，按墨迹投影切会把一个符号切成两半。
+11. **截图要 PNG 原图** —— JPG 噪点会让指纹抖动。
+12. **PowerShell 逐像素太慢** —— 热路径已下沉到 `MtGV.QuickOps`，别改回托管循环。
 
-## 下一步要做的事
+## 下一步
 
-1. **P1**：真实点击一个固定按钮 → 帧差验证 → 失败即熔断。点击坐标走 `ConvertFrom-ReferencePoint`（已处理分辨率与 DPI 换算）
-2. **P2**：测验页没有文字标签，需要**固定网格标定**（一次人工标定 + 锚点校验）；空槽位按描边色 RGB 检测（**不用颜色名，避免色觉差异影响**）
-3. 补录符号：`加`、`减`、`=`、`正确`、`测验`、`order?` 等（目前 43 个库里没有）
-4. 待解符号：`g003` / `g009` / `g013`（全在 p1）
+1. 用 `docs/SOLVER-PROMPT.md` 实测一轮求解：读区域 → 推断 → 点候选 → 复核
+2. 把旧的 `glyphbook` 台账与插件的 `shapeId` 对齐（同形同 ID 的跨会话稳定性）
+3. 收集工具故障样本，按提示词里的协议反哺修复
 
 ## 设计原则（别偏离）
 
-- **感知层"笨"，求解层"聪明"**：切格/指纹/查表是机械工作，不允许夹带语义猜测；所有词义判断必须由 LLM 给出并留痕，否则测的就不是模型能力了。
-- **同形必同义**（游戏保证）：同一 ID 出现两种译文、或两个 ID 被赋同一译文 → 立刻报警。这是最便宜的地面真值。
-- **失败即停**：截不到图 / 不在前台 / 动作无效 → 停下来通知用户，不重试、不盲点。
+- **接口只做「手和眼」**：不返回页面语义、不返回分区名、不读译文/答案表。所有词义判断必须由 LLM 给出并留痕。
+- **感知层"笨"，求解层"聪明"**：切格/指纹/哈希是机械工作，不夹带语义猜测。
+- **同形必同义**（游戏保证）：同一 `shapeId` 出现两种译文、或两个 ID 被赋同一译文 → 立刻报警。
+- **失败即停**：截不到 / 点不动 / 字段异常 → 停下来反馈，不重试、不盲点（见提示词第 6 节）。
