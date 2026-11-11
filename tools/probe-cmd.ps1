@@ -1,12 +1,11 @@
 # probe-cmd.ps1 —— 往探针发一条界面命令并打印结果
 #
 # 用法：
-#   pwsh -NoProfile -File .\tools\probe-cmd.ps1 pages
-#   pwsh -NoProfile -File .\tools\probe-cmd.ps1 slots
+#   pwsh -NoProfile -File .\tools\probe-cmd.ps1 screen
 #   pwsh -NoProfile -File .\tools\probe-cmd.ps1 "click 40 160 R"
 #
 # 命令白名单（只有界面读写，别的一概没有）
-#   读：pages / slots / state
+#   读：screen / state
 #   写：click <x> <y> [L|R]   —— 屏幕坐标（左上原点），交给游戏自己的点击逻辑
 #
 # click 不移动真实鼠标、不需要前台：插件临时改写 Unity 的输入查询，

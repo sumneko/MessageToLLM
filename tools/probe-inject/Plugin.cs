@@ -140,45 +140,12 @@ namespace MtLProbe
 
             switch (name)
             {
-                case "pages":
+                case "screen":
                     {
-                        StringBuilder b = new StringBuilder();
-                        b.Append("{\"ok\": true, \"data\": {");
-                        b.Append("\"page\": ").Append(J(GS(_draw, "current_page")));
-                        b.Append(", \"prevPage\": ").Append(J(GS(_draw, "prev_page")));
-                        b.Append(", \"leftPage\": ").Append(ListToJson(GV(_draw, "currentleftpage")));
-                        b.Append(", \"rightPageIndex\": ").Append(GI(_draw, "currentrightpage"));
-                        b.Append(", \"isRiddle\": ").Append(CallBool(_draw, "CurrentPageIsRiddle") ? "true" : "false");
-                        b.Append(", \"isMenu\": ").Append(CallBool(_draw, "CurrentPageIsMenu") ? "true" : "false");
-                        b.Append(", \"isMessage\": ").Append(CallBool(_draw, "CurrentPageIsMessage") ? "true" : "false");
-                        b.Append(", \"isBook\": ").Append(CallBool(_draw, "CurrentPageIsBook") ? "true" : "false");
-                        b.Append(", \"isQuiz\": ").Append(GB(_draw, "isQuiz") ? "true" : "false");
-                        b.Append("}}");
-                        return b.ToString();
-                    }
-
-                case "slots":
-                    {
-                        // 全量导出：只有「在哪、多大、什么形状」，不含任何译文
-                        StringBuilder b = new StringBuilder();
-                        Array slots = GV(_draw, "alien_slots") as Array;
-                        b.Append("{\"ok\": true, \"data\": {\"dim\": ");
-                        if (slots == null) { b.Append("null, \"items\": []}}"); return b.ToString(); }
-                        b.Append("[").Append(slots.GetLength(0)).Append(", ").Append(slots.GetLength(1)).Append("], \"items\": [");
-                        bool first = true;
-                        for (int i = 0; i < slots.GetLength(0); i++)
-                        {
-                            for (int j = 0; j < slots.GetLength(1); j++)
-                            {
-                                object ac = slots.GetValue(i, j);
-                                if (ac == null) continue;
-                                if (!first) b.Append(", ");
-                                first = false;
-                                b.Append(SlotJson(ac, i, j));
-                            }
-                        }
-                        b.Append("]}}");
-                        return b.ToString();
+                        // 只给几何：几个区域、各自位置、区域内符号。区域是什么含义由 LLM 自己推。
+                        string body = BuildScreenData();
+                        if (body == null) return "{\"ok\": false, \"error\": \"draw not found\"}";
+                        return "{\"ok\": true, \"data\": " + body + "}";
                     }
 
                 // ---------- 维护命令（不属于 solver 界面接口，别让玩游戏的 LLM 用） ----------
@@ -265,7 +232,7 @@ namespace MtLProbe
                     }
 
                 default:
-                    return "{\"ok\": false, \"error\": \"unknown cmd\", \"known\": [pages, slots, state, click <x> <y> [L|R]]\"}";
+                    return "{\"ok\": false, \"error\": \"unknown cmd\", \"known\": [screen, click <x> <y> [L|R], state]\"}";
             }
         }
 
@@ -277,33 +244,9 @@ namespace MtLProbe
             return p;
         }
 
-        static string ListToJson(object v)
-        {
-            IEnumerable e = v as IEnumerable;
-            if (e == null || v is string) return J(v == null ? null : v.ToString());
-            StringBuilder b = new StringBuilder("[");
-            bool first = true;
-            foreach (object o in e)
-            {
-                if (!first) b.Append(", ");
-                first = false;
-                b.Append(J(o == null ? null : o.ToString()));
-            }
-            b.Append("]");
-            return b.ToString();
-        }
-
-        static bool CallBool(object obj, string method)
-        {
-            MethodInfo m = obj.GetType().GetMethod(method, BF);
-            if (m == null) return false;
-            object r = m.Invoke(obj, null);
-            return r != null && Convert.ToBoolean(r);
-        }
-
         // 符号在屏幕上的矩形（像素，左上原点），供外部从截图里裁图。
         // 相当于人眼看到的「这个符号在哪一块」，不含任何语义。
-        static string ScreenRectJson(object ac)
+        static int[] ScreenRect(object ac)
         {
             Vector3 world = new Vector3(-1, -1, 0);
             Vector2 size = new Vector2(-1, -1);
@@ -334,32 +277,153 @@ namespace MtLProbe
 
             int wpx = (int)Math.Round(w);
             int hpx = (int)Math.Round(h);
-            // 对外给左上角（截图坐标系，左上原点），方便直接裁图
+            // 截图坐标系（左上原点）的左上角
             int sx = (int)Math.Round(screen.x - w / 2f);
             int sy = (int)Math.Round(Screen.height - screen.y - h / 2f);
-            return "{\"sx\": " + sx + ", \"sy\": " + sy + ", \"w\": " + wpx + ", \"h\": " + hpx + "}";
+            return new int[] { sx, sy, wpx, hpx };
         }
 
-        // 槽位对外表示：位置 + 尺寸 + 形状哈希。不含 alien_txt / line_str 这类译文。
-        string SlotJson(object ac, int i, int j)
+        // 槽位对外表示：位置 + 尺寸 + 形状。不含 sector / 译文 / 任何语义。
+        static string SlotJson(int i, int j, int[] sp, string shapeId, float edge)
         {
+            return "{\"x\": " + i + ", \"y\": " + j
+                + ", \"shapeId\": " + J(shapeId)
+                + ", \"edge\": " + edge.ToString("0.###")
+                + ", \"sp\": [" + sp[0] + ", " + sp[1] + ", " + sp[2] + ", " + sp[3] + "]}";
+        }
+
+        // 整屏：按游戏自己的分区分组 → 「有几个区域 + 区域框 + 区域内符号」。
+        // 区域代表什么，由 LLM 自己看符号推。
+        string BuildScreenData()
+        {
+            Resolve();
+            if (_draw == null) return null;
+
+            Array slots = GV(_draw, "alien_slots") as Array;
             StringBuilder b = new StringBuilder();
-            b.Append("{\"x\": ").Append(i).Append(", \"y\": ").Append(j);
-            b.Append(", \"slot\": ").Append(GI(ac, "slot_index"));
-            b.Append(", \"sector\": ").Append(J(GS(ac, "sector")));
-            b.Append(", \"showtxt\": ").Append(GB(ac, "showtxt") ? "true" : "false");
-            b.Append(", \"shapeId\": ").Append(J(ShapeHash(ac)));
-            b.Append(", \"sp\": ").Append(ScreenRectJson(ac));
-            b.Append("}");
+            b.Append("{\"screen\": [").Append(Screen.width).Append(", ").Append(Screen.height).Append("]");
+            if (slots == null) { b.Append(", \"regions\": []}"); return b.ToString(); }
+
+            int nx = slots.GetLength(0), ny = slots.GetLength(1);
+            object[,] cell = new object[nx, ny];
+            string[,] shapeIds = new string[nx, ny];
+            float[,] edges = new float[nx, ny];
+            int[,][] box = new int[nx, ny][];
+
+            // 先收集所有有 sprite 的格
+            List<string> allShapes = new List<string>();
+            for (int i = 0; i < nx; i++)
+            {
+                for (int j = 0; j < ny; j++)
+                {
+                    object ac = slots.GetValue(i, j);
+                    if (ac == null) continue;
+                    float ink, edge;
+                    string sid = ShapeHash(ac, out ink, out edge);
+                    if (sid == null) continue;
+                    allShapes.Add(sid);
+                    cell[i, j] = ac;
+                    shapeIds[i, j] = sid;
+                    edges[i, j] = edge;
+                    box[i, j] = ScreenRect(ac);
+                }
+            }
+
+            // 空格判定：出现次数最多的形状，且占比 ≥ 40% —— 当作「空白底」，不参与分区。
+            // 判定结果会写进输出的 blank 字段，LLM 能看到这次把谁当空了。
+            string blank = null;
+            if (allShapes.Count > 0)
+            {
+                Dictionary<string, int> freq = new Dictionary<string, int>();
+                foreach (string s in allShapes)
+                {
+                    int c;
+                    freq.TryGetValue(s, out c);
+                    freq[s] = c + 1;
+                }
+                string top = null;
+                int best = 0;
+                foreach (KeyValuePair<string, int> kv in freq)
+                {
+                    if (kv.Value > best) { best = kv.Value; top = kv.Key; }
+                }
+                if (top != null && best >= allShapes.Count * 0.4) blank = top;
+            }
+
+            if (blank != null)
+            {
+                for (int i = 0; i < nx; i++)
+                {
+                    for (int j = 0; j < ny; j++)
+                    {
+                        if (cell[i, j] != null && shapeIds[i, j] == blank) cell[i, j] = null;
+                    }
+                }
+            }
+            b.Append(", \"blank\": ").Append(J(blank));
+
+            // 按游戏自己的分区分组（AlienCharacter.sector）；分区名不外泄，只给不透明序号 r0/r1/...
+            Dictionary<string, List<int[]>> groups = new Dictionary<string, List<int[]>>();
+            for (int i = 0; i < nx; i++)
+            {
+                for (int j = 0; j < ny; j++)
+                {
+                    if (cell[i, j] == null) continue;
+                    string sec = GS(cell[i, j], "sector");
+                    if (sec == null) sec = "";
+                    List<int[]> g;
+                    if (!groups.TryGetValue(sec, out g)) { g = new List<int[]>(); groups.Add(sec, g); }
+                    g.Add(new int[] { i, j });
+                }
+            }
+
+            List<List<int[]>> comps = new List<List<int[]>>(groups.Values);
+            comps.Sort(delegate (List<int[]> x, List<int[]> y)
+            {
+                int ax = int.MaxValue, ay = int.MaxValue, bx = int.MaxValue, by = int.MaxValue;
+                foreach (int[] c in x) { int[] r0 = box[c[0], c[1]]; if (r0[0] < ax) ax = r0[0]; if (r0[1] < ay) ay = r0[1]; }
+                foreach (int[] c in y) { int[] r0 = box[c[0], c[1]]; if (r0[0] < bx) bx = r0[0]; if (r0[1] < by) by = r0[1]; }
+                if (ay != by) return ay.CompareTo(by);
+                return ax.CompareTo(bx);
+            });
+
+            b.Append(", \"regions\": [");
+            for (int r = 0; r < comps.Count; r++)
+            {
+                List<int[]> comp = comps[r];
+                int minX = int.MaxValue, minY = int.MaxValue, maxX = -1, maxY = -1;
+                StringBuilder items = new StringBuilder();
+
+                for (int k = 0; k < comp.Count; k++)
+                {
+                    int[] rc = comp[k];
+                    int[] sp = ScreenRect(cell[rc[0], rc[1]]);
+                    if (sp[0] < minX) minX = sp[0];
+                    if (sp[1] < minY) minY = sp[1];
+                    if (sp[0] + sp[2] > maxX) maxX = sp[0] + sp[2];
+                    if (sp[1] + sp[3] > maxY) maxY = sp[1] + sp[3];
+                    if (k > 0) items.Append(", ");
+                    items.Append(SlotJson(rc[0], rc[1], sp, shapeIds[rc[0], rc[1]], edges[rc[0], rc[1]]));
+                }
+
+                if (r > 0) b.Append(", ");
+                b.Append("{\"id\": ").Append(r)
+                 .Append(", \"cells\": ").Append(comp.Count)
+                 .Append(", \"box\": [").Append(minX).Append(", ").Append(minY).Append(", ").Append(maxX - minX).Append(", ").Append(maxY - minY).Append("]")
+                 .Append(", \"items\": [").Append(items).Append("]}");
+            }
+            b.Append("]}");
             return b.ToString();
         }
 
         static readonly Dictionary<string, string> _shapeCache = new Dictionary<string, string>();
 
         // 形状指纹：对 sprite 自己的纹理区域做 FNV 哈希 —— 同形同 ID，且不含任何词义。
-        // 纹理不可读（未开 Read/Write）时返回 null，由外部按 sp 矩形从截图裁图。
-        static string ShapeHash(object ac)
+        // edge = 相邻像素亮度差超阈值的比例（笔画才有边缘，纯色块≈0），用来自动剔除空格。
+        static string ShapeHash(object ac, out float ink, out float edge)
         {
+            ink = 0f;
+            edge = 0f;
             SpriteRenderer sr = GV(ac, "sp") as SpriteRenderer;
             if (sr == null || sr.sprite == null) return null;
             Texture2D tex = sr.sprite.texture;
@@ -368,7 +432,13 @@ namespace MtLProbe
             Rect tr = sr.sprite.textureRect;
             string key = tex.name + "|" + tr.ToString();
             string cached;
-            if (_shapeCache.TryGetValue(key, out cached)) return cached;
+            if (_shapeCache.TryGetValue(key, out cached))
+            {
+                string[] parts = cached.Split('|');
+                ink = float.Parse(parts[1]);
+                edge = float.Parse(parts[2]);
+                return parts[0];
+            }
 
             try
             {
@@ -377,20 +447,36 @@ namespace MtLProbe
                 int tw = tex.width;
                 int x0 = (int)tr.x, y0 = (int)tr.y, w = (int)tr.width, h = (int)tr.height;
                 uint hash = 2166136261u;
+                long solid = 0, edges = 0, pairs = 0;
+
                 for (int yy = 0; yy < h; yy++)
                 {
                     int row = (y0 + yy) * tw;
                     for (int xx = 0; xx < w; xx++)
                     {
                         Color32 c = px[row + x0 + xx];
+                        if (c.a > 40) solid++;
                         hash = (hash ^ c.r) * 16777619u;
                         hash = (hash ^ c.g) * 16777619u;
                         hash = (hash ^ c.b) * 16777619u;
                         hash = (hash ^ c.a) * 16777619u;
+
+                        if (xx + 1 < w)
+                        {
+                            Color32 n = px[row + x0 + xx + 1];
+                            pairs++;
+                            // 字形可能只体现在 alpha 上（白色 sprite + alpha 遮罩），所以两边都看
+                            int da = Math.Abs(c.a - n.a);
+                            int dl = Math.Abs((c.r + c.g + c.b) - (n.r + n.g + n.b)) / 3;
+                            if (da > 32 || dl > 48) edges++;
+                        }
                     }
                 }
+
+                ink = (float)solid / (float)(w * h);
+                edge = pairs == 0 ? 0f : (float)edges / (float)pairs;
                 string id = "s" + hash.ToString("x8");
-                _shapeCache[key] = id;
+                _shapeCache[key] = id + "|" + ink.ToString("0.####") + "|" + edge.ToString("0.####");
                 return id;
             }
             catch
@@ -443,53 +529,11 @@ namespace MtLProbe
 
         void Snapshot()
         {
-            Resolve();
-
             StringBuilder sb = new StringBuilder();
-            sb.Append("{\n");
-            sb.Append("  \"time\": \"").Append(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")).Append("\",\n");
-            sb.Append("  \"unity\": \"").Append(Application.unityVersion).Append("\",\n");
-            sb.Append("  \"drawFound\": ").Append(_draw != null ? "true" : "false");
-
-            if (_draw != null)
-            {
-                sb.Append(",\n  \"page\": ").Append(J(GS(_draw, "current_page")));
-                sb.Append(",\n  \"rightPage\": ").Append(GI(_draw, "currentrightpage"));
-                sb.Append(",\n  \"category\": ").Append(J(GS(_draw, "current_categoryname")));
-                sb.Append(",\n  \"isQuiz\": ").Append(GB(_draw, "isQuiz") ? "true" : "false");
-                sb.Append(",\n  \"understandLv\": ").Append(GI(_draw, "understand_lv"));
-                sb.Append(",\n  \"understandTest\": ").Append(GI(_draw, "understand_test"));
-                sb.Append(",\n  \"selectedCount\": ").Append(CountOf(GV(_draw, "selected")));
-
-                Array slots = GV(_draw, "alien_slots") as Array;
-                if (slots == null)
-                {
-                    sb.Append(",\n  \"slots\": null");
-                }
-                else
-                {
-                    sb.Append(",\n  \"slotsDim\": [").Append(slots.GetLength(0)).Append(", ").Append(slots.GetLength(1)).Append("]");
-                    sb.Append(",\n  \"slots\": [");
-                    StringBuilder items = new StringBuilder();
-                    int written = 0;
-                    for (int i = 0; i < slots.GetLength(0) && written < 40; i++)
-                    {
-                        for (int j = 0; j < slots.GetLength(1) && written < 40; j++)
-                        {
-                            object ac = slots.GetValue(i, j);
-                            if (ac == null) continue;
-                            if (written > 0) items.Append(", ");
-                            items.Append(SlotJson(ac, i, j));
-                            written++;
-                        }
-                    }
-                    sb.Append(items);
-                    sb.Append("]");
-                }
-            }
-
+            sb.Append("{\n  \"time\": \"").Append(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")).Append("\",\n  \"data\": ");
+            string body = BuildScreenData();
+            sb.Append(body == null ? "null" : body);
             sb.Append("\n}\n");
-
             File.WriteAllText(Path.Combine(OutDir, "state.json"), sb.ToString(), Encoding.UTF8);
         }
 
@@ -510,12 +554,6 @@ namespace MtLProbe
         {
             object v = GV(obj, field);
             return v == null ? -1 : Convert.ToInt32(v);
-        }
-
-        static bool GB(object obj, string field)
-        {
-            object v = GV(obj, field);
-            return v != null && Convert.ToBoolean(v);
         }
 
         static int CountOf(object v)

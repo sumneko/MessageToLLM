@@ -118,8 +118,8 @@ csc 编译插件需要这几个引用（少一个就 CS0012）：
 **边界：只做「人肉眼 + 人点鼠标」能拿到/做到的事，不给语义、不给答案、不给跳页捷径。**
 
 ```powershell
-pwsh -NoProfile -File .\tools\probe-cmd.ps1 pages
-pwsh -NoProfile -File .\tools\probe-cmd.ps1 slots
+pwsh -NoProfile -File .\tools\probe-cmd.ps1 screen
+pwsh -NoProfile -File .\tools\probe-cmd.ps1 screen
 pwsh -NoProfile -File .\tools\probe-cmd.ps1 'click 40 160 R'
 ```
 
@@ -127,12 +127,18 @@ pwsh -NoProfile -File .\tools\probe-cmd.ps1 'click 40 160 R'
 
 | 命令 | 返回 |
 |---|---|
-| `pages` | `page` / `prevPage` / `leftPage` / `rightPageIndex` + `isRiddle/isMenu/isMessage/isBook/isQuiz` —— 相当于「当前在哪一屏」 |
-| `slots` | `dim` + 每个非空格：`x` `y`（网格）、`slot`、`sector`（版面分区名）、`showtxt`（该格译文是否正在显示）、**`shapeId`**、**`sp{sx,sy,w,h}`** |
-| `state` | 立刻重写一次 `state.json`（1Hz 自动刷新，内容同上，最多 40 格） |
+| `screen` | `screen`（画面尺寸）、`blank`（本次被判定为空白底的 shapeId）、`regions[]` |
+| `state` | 立刻重写一次 `state.json`（1Hz 自动刷新，内容与 `screen` 相同） |
 
-- **`shapeId`**：对 sprite 自身的纹理区域做 FNV-1a 哈希（`s` + 8 位十六进制）。**同形同 ID，异形异 ID，不含任何词义**。纹理不可直接读时用 `Graphics.Blit` 拷到临时 RT 再读。实测：216 格全部拿到 ID，本屏 19 个不同形状，连续两次 `slots` 的 216 条 ID **零差异**。
-- **`sp`**：该符号在**截图坐标系（左上原点）**下的矩形，实测每格 80×80（1080p），与 `README.md` 的 `格宽 80` 吻合。按它裁 PrintWindow 帧即可得图形（样例 `runs/inject/crops/c0-7.png`、`c12-3.png`，均为单格干净裁图）。
+`regions[]` 每项：`id`（不透明序号 `r0/r1/...`，按位置从上到下、从左到右排序）、`cells`、`box`（区域框 `[x,y,w,h]`）、`items[]`。
+`items[]` 每项：`x` `y`（网格号）、`shapeId`、`edge`（边缘密度）、`sp`（该格矩形 `[sx,sy,w,h]`）。
+
+**不给语义**：没有页面名、没有 `isRiddle/isMenu/...` 这类判定、没有 `sector` 名。区域是什么（标题栏 / 题面 / 候选区 / 菜单）**必须由 LLM 自己从符号和位置推**。
+
+- **区域怎么来**：直接用游戏自己的分区字段（`AlienCharacter.sector`：`lefttitle / lefttext / leftmenu / righttitle / righttextdown / righttextup / rightmenu`），但**只输出不透明序号**，分区名不外泄。
+- **空格怎么判**：出现次数最多的 `shapeId` 且占比 ≥ 40% 视为空白底，不参与分区；这次判成谁写在 `blank` 字段里。实测首页 `blank=sdd4ceb52`，分成 5 个区域。
+- **`shapeId`**：sprite 自身纹理区域的 FNV-1a 哈希（`s` + 8 位十六进制）。同形同 ID、异形异 ID、不含词义；连续两次 `screen` 结果零差异（216 格实测）。
+- **`sp`**：截图坐标系（左上原点）矩形，实测每格 80×80（1080p），与 `README.md` 的 `格宽 80` 吻合。看形状：`tools/shot.ps1 -Rect <sp>`。
 
 ### 写（手）
 
@@ -146,7 +152,7 @@ pwsh -NoProfile -File .\tools\probe-cmd.ps1 'click 40 160 R'
 |---|---|
 | `click 40 160 R`（右键某符号格） | 帧差 **1.09%**，左栏立刻变成该符号的笔记 —— 与物理右键同效果 |
 | `click 1794 36 L`（左键「笔记」页签） | 帧差 **1.09%**，`leftPage` 从 `["0"]` 变 `["0","0","0"]`（页面栈推进） |
-| `pages` / `slots` / `state` | 均正常 |
+| `screen` / `state` | 均正常 |
 
 **填空闭环（算式题页，实测通过）**：先点候选数字格，再点答案框。
 
@@ -157,7 +163,7 @@ click 1160 160 L  →  click 1080 400 L
 (13,5).shapeId: s2cd185fc → sf0fcc14c   （变成候选 3 的 shapeId）
 ```
 
-所以填一格的完整协议是：`slots` 读格子 → 找候选格的 `sp` 中心 → `click` 候选 → `click` 答案框 → 再 `slots` 校验目标格 `shapeId` 变成候选的 `shapeId`。
+所以填一格的完整协议是：`screen` 读格子 → 找候选格的 `sp` 中心 → `click` 候选 → `click` 答案框 → 再 `slots` 校验目标格 `shapeId` 变成候选的 `shapeId`。
 
 两个坑（都踩过）：
 1. 坐标必须是**格子中心**（`sp.sx + w/2`, `sp.sy + h/2`）。我第一次把候选算到空格上，点下去毫无反应，误判成「填不进去」。
@@ -176,7 +182,7 @@ click 1160 160 L  →  click 1080 400 L
 
 ### 实测结论
 
-导航与操作全部走 `click`：点页签翻页、点符号看笔记、点槽位填答案 —— 都是游戏自己判定的结果，插件只伪造「鼠标在这里按下了」。填空流程 = `slots` 读格子与形状 → 决策 → `click` 点候选/槽位 → 帧差或截图复核，全程后台。
+导航与操作全部走 `click`：点页签翻页、点符号看笔记、点槽位填答案 —— 都是游戏自己判定的结果，插件只伪造「鼠标在这里按下了」。填空流程 = `screen` 读格子与形状 → 决策 → `click` 点候选/槽位 → 帧差或截图复核，全程后台。
 
 ## 维护命令（不属于 solver 界面接口）
 
