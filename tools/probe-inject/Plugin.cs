@@ -257,7 +257,7 @@ namespace MtLProbe
                             for (int j = 0; j < slots.GetLength(1); j++)
                             {
                                 object character = slots.GetValue(i, j);
-                                if (character == null) continue;
+                                if (character == null || !IsVisibleCharacter(character)) continue;
                                 float ink, edge;
                                 if (ShapeHash(character, out ink, out edge) != shapeId) continue;
 
@@ -342,6 +342,18 @@ namespace MtLProbe
             return text == "?" ? null : text;
         }
 
+        static bool IsVisibleCharacter(object character)
+        {
+            Component component = character as Component;
+            if (component == null || !component.gameObject.activeInHierarchy) return false;
+            SpriteRenderer renderer = GV(character, "sp") as SpriteRenderer;
+            return renderer != null
+                && renderer.enabled
+                && renderer.gameObject.activeInHierarchy
+                && renderer.color.a > 0.01f
+                && renderer.isVisible;
+        }
+
         // 整屏：按游戏自己的分区分组 → 「有几个区域 + 区域框 + 区域内符号」。
         // 区域代表什么，由 LLM 自己看符号推。
         string BuildScreenData(out List<RegionSnapshot> regionSnapshots)
@@ -371,7 +383,7 @@ namespace MtLProbe
                 for (int j = 0; j < ny; j++)
                 {
                     object ac = slots.GetValue(i, j);
-                    if (ac == null) continue;
+                    if (ac == null || !IsVisibleCharacter(ac)) continue;
                     float ink, edge;
                     string sid = ShapeHash(ac, out ink, out edge);
                     if (sid == null) continue;

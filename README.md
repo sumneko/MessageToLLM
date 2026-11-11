@@ -43,9 +43,9 @@ pwsh -NoProfile -File .\tools\shot.ps1 -Rect 1040,360,80,80 -Scale 4
 | 命令 | 说明 |
 |---|---|
 | `pwsh -NoProfile -File .\tools\game-control.ps1 status` | 输出 `closed`、`running`、`minimized` 或 `not-foreground` |
-| `pwsh -NoProfile -File .\tools\game-control.ps1 start` | 通过 Steam 启动游戏；若进程已存在则不重复启动 |
+| `pwsh -NoProfile -File .\tools\game-control.ps1 start` | 启动安装目录中的游戏 EXE；若 EXE 不存在则回退 Steam URI，进程已存在时不重复启动 |
 
-命令返回 JSON；启动默认最多等待 150 秒，可用 `-TimeoutSec` 调整。
+命令返回 JSON；默认游戏目录为 `D:\steam\steamapps\common\Message From Aliens`，可用 `-GameDir` 覆盖；启动默认最多等待 150 秒，可用 `-TimeoutSec` 调整。
 
 ## 后台界面接口
 

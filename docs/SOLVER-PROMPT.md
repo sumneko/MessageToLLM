@@ -39,6 +39,7 @@ pwsh -NoProfile -File .\tools\shot.ps1 -Rect <sx,sy,w,h> [-Scale 4]
 
 - **`shapeId`** 是形状指纹（`s` + 8 位十六进制）。**同形同 ID、异形异 ID、不含任何词义**。它就是你要用的符号唯一 ID，跨页、跨会话都稳定。
 - `grid` 含 `rows`、`cols`、`firstCenter`（左上格中心的截图坐标）、`step`（横纵格距）和 `symbolSize`（统一符号宽高）。
+- `regions[]` 只包含当前激活且实际可见的符号；隐藏 GameObject、禁用/透明 Renderer 或相机不可见的对象会被过滤。
 - 行列号从左上角开始、从 1 起算。`RrCc` 的中心坐标为 `x = firstCenter[0] + (c - 1) * step[0]`、`y = firstCenter[1] + (r - 1) * step[1]`。
 - 每个区域的 `items[]` 按指纹去重：每项含 `{shapeId, positions}`，`positions` 是该形状在区域内出现的 `RrCc` 列表；有已填译文时还会含 `translation`。相同 shapeId 可能在同一区域出现多次，只会在该区域列出一次。
 - `translation` 只在输入框有非空内容且内容不等于单独的 `?` 时返回。若同形位置有不同译文，回包会带 `translationConflict:true`；不要把冲突值当成定论。

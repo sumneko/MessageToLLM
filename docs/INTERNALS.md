@@ -133,6 +133,7 @@ pwsh -NoProfile -File .\tools\probe-cmd.ps1 'translate s12345678 hello'
 | `translate <shapeId> <text>` | 主线程定位当前画面的符号，调用其 `AlienCharacter.EndEdit(string)` 提交译文 |
 
 `grid` 提供 `rows`、`cols`、左上格中心、步长和统一符号尺寸。`regions[]` 每项包含 `id`、`cells` 和 `items[]`；`items[]` 按 `shapeId` 去重，每项包含该符号出现位置的 `RrCc` 列表，有译文时附 `translation`（空白和单独 `?` 不返回）。
+`regions[]` 只保留 `AlienCharacter` 所属 GameObject 激活、`SpriteRenderer` 启用且不透明、并被相机判定可见的符号；隐藏进度残留对象不计入区域格数。
 `changes` 仅由显式 `screen` 更新基线；`state` 和 1Hz 快照不会推进基线。`translate` 返回 `submitted` 只表示调用已执行，不保证 UI 已显示；需截图复核。
 
 **不给语义**：没有页面名、没有 `isRiddle/isMenu/...` 这类判定、没有 `sector` 名。区域是什么（标题栏 / 题面 / 候选区 / 菜单）**必须由 LLM 自己从符号和位置推**。

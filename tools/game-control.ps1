@@ -4,6 +4,7 @@ param(
     [ValidateSet('status', 'start')]
     [string]$Command,
     [string]$Uri = 'steam://rungameid/1858720',
+    [string]$GameDir = 'D:\steam\steamapps\common\Message From Aliens',
     [int]$TimeoutSec = 150
 )
 
@@ -20,7 +21,7 @@ try {
         exit 0
     }
 
-    $startResult = Start-Game -Uri $Uri -TimeoutSec $TimeoutSec
+    $startResult = Start-Game -Uri $Uri -GameDir $GameDir -TimeoutSec $TimeoutSec
     $ok = $startResult -ne 'timeout'
     [ordered]@{
         ok      = $ok

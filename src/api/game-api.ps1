@@ -14,7 +14,7 @@
 #                         Method=Crop（默认，裁剪译文框做像素比对，毫秒级、不碰鼠标）
 #                         Method=Ocr / Clipboard 为备选
 #   game_state()         running / closed / minimized / not-foreground
-#   start_game()         通过 Steam 启动并等到窗口出现
+#   start_game()         优先启动安装目录 EXE，缺失时回退 Steam URI
 #   merge_symbols / split_symbol  台账纠错
 #
 # 所有坐标参数都不含分辨率：行号/列号基于块内网格，相对位置是 0-1。
@@ -82,9 +82,19 @@ function Get-GameState {
 }
 
 function Start-Game {
-    param([string]$Uri = 'steam://rungameid/1858720', [int]$TimeoutSec = 150)
+    param(
+        [string]$Uri = 'steam://rungameid/1858720',
+        [string]$GameDir = 'D:\steam\steamapps\common\Message From Aliens',
+        [int]$TimeoutSec = 150
+    )
     if (Get-Process MessageFromAliens -ErrorAction SilentlyContinue) { return 'already-running' }
-    Start-Process $Uri
+    $gameExe = Join-Path $GameDir 'MessageFromAliens.exe'
+    if (Test-Path $gameExe) {
+        Start-Process -FilePath $gameExe -WorkingDirectory $GameDir
+    }
+    else {
+        Start-Process $Uri
+    }
     $deadline = (Get-Date).AddSeconds($TimeoutSec)
     while ((Get-Date) -lt $deadline) {
         $p = Get-Process MessageFromAliens -ErrorAction SilentlyContinue |
