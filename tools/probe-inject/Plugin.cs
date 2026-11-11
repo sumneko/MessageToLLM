@@ -136,7 +136,7 @@ namespace MtLProbe
             File.WriteAllText(_resultPath, result + "\n", Encoding.UTF8);
         }
 
-        // 只读白名单。任何会改游戏状态的命令都不在这里。
+        // 界面命令白名单。译文只允许通过 translate 提交，不暴露任意内部方法调用。
         string Execute(string cmd)
         {
             int sp = cmd.IndexOf(' ');
@@ -242,8 +242,39 @@ namespace MtLProbe
                         return "{\"ok\": true, \"data\": {\"click\": [" + x + ", " + y + "], \"button\": " + J(btn == 1 ? "R" : "L") + "}}";
                     }
 
+                case "translate":
+                    {
+                        string[] p = SplitArgs(arg, 2);
+                        if (p == null || p.Length < 2 || string.IsNullOrWhiteSpace(p[1]))
+                            return "{\"ok\": false, \"error\": \"usage: translate <shapeId> <text>\"}";
+                        string shapeId = p[0].Trim();
+                        string text = p[1];
+                        Array slots = GV(_draw, "alien_slots") as Array;
+                        if (slots == null) return "{\"ok\": false, \"error\": \"slots not found\"}";
+
+                        for (int i = 0; i < slots.GetLength(0); i++)
+                        {
+                            for (int j = 0; j < slots.GetLength(1); j++)
+                            {
+                                object character = slots.GetValue(i, j);
+                                if (character == null) continue;
+                                float ink, edge;
+                                if (ShapeHash(character, out ink, out edge) != shapeId) continue;
+
+                                MethodInfo endEdit = character.GetType().GetMethod("EndEdit", BF, null,
+                                    new Type[] { typeof(string) }, null);
+                                if (endEdit == null)
+                                    return "{\"ok\": false, \"error\": \"EndEdit(string) not found\"}";
+                                endEdit.Invoke(character, new object[] { text });
+                                return "{\"ok\": true, \"data\": {\"shapeId\": " + J(shapeId)
+                                    + ", \"status\": \"submitted\"}}";
+                            }
+                        }
+                        return "{\"ok\": false, \"error\": \"shapeId not found in current screen\"}";
+                    }
+
                 default:
-                    return "{\"ok\": false, \"error\": \"unknown cmd\", \"known\": [screen, click <x> <y> [L|R], state]\"}";
+                    return "{\"ok\": false, \"error\": \"unknown cmd\", \"known\": [screen, click <x> <y> [L|R], translate <shapeId> <text>, state]}";
             }
         }
 
@@ -299,6 +330,18 @@ namespace MtLProbe
             return "R" + (rows - y) + "C" + (x + 1);
         }
 
+        static string GetTranslationText(object character)
+        {
+            object input = GV(character, "txt");
+            if (input == null) return null;
+            PropertyInfo textProperty = input.GetType().GetProperty("text", BF);
+            if (textProperty == null) return null;
+            string text = textProperty.GetValue(input, null) as string;
+            if (string.IsNullOrWhiteSpace(text)) return null;
+            text = text.Trim();
+            return text == "?" ? null : text;
+        }
+
         // 整屏：按游戏自己的分区分组 → 「有几个区域 + 区域框 + 区域内符号」。
         // 区域代表什么，由 LLM 自己看符号推。
         string BuildScreenData(out List<RegionSnapshot> regionSnapshots)
@@ -316,6 +359,7 @@ namespace MtLProbe
             int pitchX = Screen.width / nx, pitchY = Screen.height / ny;
             object[,] cell = new object[nx, ny];
             string[,] shapeIds = new string[nx, ny];
+            string[,] translations = new string[nx, ny];
             int[,][] box = new int[nx, ny][];
             int[] symbolSize = null;
             int[] firstCenter = null;
@@ -334,6 +378,7 @@ namespace MtLProbe
                     allShapes.Add(sid);
                     cell[i, j] = ac;
                     shapeIds[i, j] = sid;
+                    translations[i, j] = GetTranslationText(ac);
                     box[i, j] = ScreenRect(ac);
                     if (symbolSize == null) symbolSize = new int[] { box[i, j][2], box[i, j][3] };
                     if (firstCenter == null)
@@ -449,14 +494,25 @@ namespace MtLProbe
                         return rowCmp != 0 ? rowCmp : a[0].CompareTo(c[0]);
                     });
                     items.Append("{\"shapeId\": ").Append(J(sid)).Append(", \"positions\": [");
+                    string translation = null;
+                    bool translationConflict = false;
                     for (int p = 0; p < positions.Count; p++)
                     {
                         if (p > 0) items.Append(", ");
                         string position = CellName(positions[p][0], positions[p][1], ny);
                         regionPositions.Add(position);
                         items.Append(J(position));
+                        string value = translations[positions[p][0], positions[p][1]];
+                        if (value != null)
+                        {
+                            if (translation == null) translation = value;
+                            else if (translation != value) translationConflict = true;
+                        }
                     }
-                    items.Append("]}");
+                    items.Append("]");
+                    if (translation != null) items.Append(", \"translation\": ").Append(J(translation));
+                    if (translationConflict) items.Append(", \"translationConflict\": true");
+                    items.Append("}");
                 }
 
                 regionSnapshots.Add(new RegionSnapshot {

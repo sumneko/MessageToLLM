@@ -3,10 +3,12 @@
 # 用法：
 #   pwsh -NoProfile -File .\tools\probe-cmd.ps1 screen
 #   pwsh -NoProfile -File .\tools\probe-cmd.ps1 "click 40 160 R"
+#   pwsh -NoProfile -File .\tools\probe-cmd.ps1 "translate s12345678 hello"
 #
 # 命令白名单（只有界面读写，别的一概没有）
 #   读：screen / state
-#   写：click <x> <y> [L|R]   —— 屏幕坐标（左上原点），交给游戏自己的点击逻辑
+#   写：click <x> <y> [L|R] / translate <shapeId> <text>
+#       click 交给游戏自己的点击逻辑；translate 调用当前符号的 EndEdit 提交译文
 #
 # click 不移动真实鼠标、不需要前台：插件临时改写 Unity 的输入查询，
 # 游戏自己认为有人点了一下。

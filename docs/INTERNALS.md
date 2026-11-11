@@ -115,34 +115,36 @@ csc 编译插件需要这几个引用（少一个就 CS0012）：
 
 命令通道：插件每 0.25s 轮询 `runs\inject\cmd.txt`，执行后删文件、回写 `runs\inject\result.json`。
 
-**边界：只做「人肉眼 + 人点鼠标」能拿到/做到的事，不给语义、不给答案、不给跳页捷径。**
+**边界：只暴露画面观察、鼠标点击和单一译文提交命令；不给语义、不给答案、不给跳页捷径，也不暴露通用反射调用。**
 
 ```powershell
 pwsh -NoProfile -File .\tools\probe-cmd.ps1 screen
 pwsh -NoProfile -File .\tools\probe-cmd.ps1 screen
 pwsh -NoProfile -File .\tools\probe-cmd.ps1 'click 40 160 R'
+pwsh -NoProfile -File .\tools\probe-cmd.ps1 'translate s12345678 hello'
 ```
 
 ### 读（眼）
 
 | 命令 | 返回 |
 |---|---|
-| `screen` | `screen`（画面尺寸）、`blank`（本次被判定为空白底的 shapeId）、`regions[]` |
+| `screen` | `screen`（画面尺寸）、`grid`、`blank`、按 shapeId 聚合的 `regions[]`、与上次显式 screen 的 `changes` |
 | `state` | 立刻重写一次 `state.json`（1Hz 自动刷新，内容与 `screen` 相同） |
+| `translate <shapeId> <text>` | 主线程定位当前画面的符号，调用其 `AlienCharacter.EndEdit(string)` 提交译文 |
 
-`regions[]` 每项：`id`（不透明序号 `r0/r1/...`，按位置从上到下、从左到右排序）、`cells`、`box`（区域框 `[x,y,w,h]`）、`items[]`。
-`items[]` 每项：`x` `y`（网格号）、`shapeId`、`edge`（边缘密度）、`sp`（该格矩形 `[sx,sy,w,h]`）。
+`grid` 提供 `rows`、`cols`、左上格中心、步长和统一符号尺寸。`regions[]` 每项包含 `id`、`cells` 和 `items[]`；`items[]` 按 `shapeId` 去重，每项包含该符号出现位置的 `RrCc` 列表，有译文时附 `translation`（空白和单独 `?` 不返回）。
+`changes` 仅由显式 `screen` 更新基线；`state` 和 1Hz 快照不会推进基线。`translate` 返回 `submitted` 只表示调用已执行，不保证 UI 已显示；需截图复核。
 
 **不给语义**：没有页面名、没有 `isRiddle/isMenu/...` 这类判定、没有 `sector` 名。区域是什么（标题栏 / 题面 / 候选区 / 菜单）**必须由 LLM 自己从符号和位置推**。
 
 - **区域怎么来**：直接用游戏自己的分区字段（`AlienCharacter.sector`：`lefttitle / lefttext / leftmenu / righttitle / righttextdown / righttextup / rightmenu`），但**只输出不透明序号**，分区名不外泄。
 - **空格怎么判**：出现次数最多的 `shapeId` 且占比 ≥ 40% 视为空白底，不参与分区；这次判成谁写在 `blank` 字段里。实测首页 `blank=sdd4ceb52`，分成 5 个区域。
 - **`shapeId`**：sprite 自身纹理区域的 FNV-1a 哈希（`s` + 8 位十六进制）。同形同 ID、异形异 ID、不含词义；连续两次 `screen` 结果零差异（216 格实测）。
-- **`sp`**：截图坐标系（左上原点）矩形，实测每格 80×80（1080p），与 `README.md` 的 `格宽 80` 吻合。看形状：`tools/shot.ps1 -Rect <sp>`。
+- **`grid`**：提供 R/C 到截图坐标的原点与步长，`symbolSize` 提供统一符号宽高；看形状时按位置算中心，再用该尺寸调用 `tools/shot.ps1 -Rect`。
 
 ### 写（手）
 
-只有一条：`click <x> <y> [L|R]` —— 屏幕坐标（左上原点），效果等同玩家在该点点了一下鼠标。
+鼠标输入只有一条：`click <x> <y> [L|R]` —— 屏幕坐标（左上原点），效果等同玩家在该点点了一下鼠标。译文提交通过受限的 `translate <shapeId> <text>` 调用当前符号的 `EndEdit(string)`。
 
 实现：Harmony 前缀临时改写 `UnityEngine.Input.get_mousePosition` / `GetMouseButton` / `GetMouseButtonDown` / `GetMouseButtonUp`（外加 `Shapes2D.InputUtils` 的同名入口），按住 3 帧再松开，随后立即解除。**不移动真实鼠标、不需要前台**，游戏自己的点击逻辑照跑。
 
@@ -163,10 +165,10 @@ click 1160 160 L  →  click 1080 400 L
 (13,5).shapeId: s2cd185fc → sf0fcc14c   （变成候选 3 的 shapeId）
 ```
 
-所以填一格的完整协议是：`screen` 读格子 → 找候选格的 `sp` 中心 → `click` 候选 → `click` 答案框 → 再 `slots` 校验目标格 `shapeId` 变成候选的 `shapeId`。
+所以填一格的完整协议是：`screen` 读格子 → 用 `grid` 的原点和步长换算候选/答案框中心 → `click` 候选 → `click` 答案框 → 再检查目标格 `shapeId` 是否变成候选的 `shapeId`。
 
 两个坑（都踩过）：
-1. 坐标必须是**格子中心**（`sp.sx + w/2`, `sp.sy + h/2`）。我第一次把候选算到空格上，点下去毫无反应，误判成「填不进去」。
+1. 坐标必须是**格子中心**，从 `RrCc` 用 `grid.firstCenter` 与 `grid.step` 换算。我第一次把候选算到空格上，点下去毫无反应，误判成「填不进去」。
 2. `GetMouseButtonDown` 必须**整帧语义**：同一帧所有调用者都返回 true。最初实现成「第一个调用者消费掉」，游戏多组件轮询时就丢了按键，表现为点击只有「看笔记」生效、填空无效。
 
 ### 明确不提供
@@ -176,13 +178,13 @@ click 1160 160 L  →  click 1080 400 L
 | `alien_txt` / `line_str` / `line_x` / `line_y` | 实测就是**英文译文**（`mankind` / `welcome` / `terran`），给了等于泄题 |
 | sprite / texture 名字 | 同理按词命名（`mankind`），不是形状标识 |
 | `goto <page>` / `parent` | 按内部页名跳页，玩家界面上没有这个动作 |
-| `put` / `clear` / `edit` / `highlight` | 内部绘制/内部方法，不是玩家动作；且实测 `DrawACToSlot` 的 x 间距是 106.7px（格子 80px），坐标与网格对不上，`edit`/`highlight` 在空格上无任何可见效果 |
+| 任意 `put` / `clear` / `edit` / `highlight` | 不暴露通用内部方法调用。唯一例外是受限的 `translate <shapeId> <text>`，只对当前画面匹配的 `AlienCharacter` 调用 `EndEdit(string)` 提交译文，不接受任意方法名 |
 | `Global.alien_text` / `word_source` / `quiz_answer` 等表 | 直接读答案 |
 | 任意字段反射读取（`field <name>`） | 通用后门，无法界定边界 |
 
 ### 实测结论
 
-导航与操作全部走 `click`：点页签翻页、点符号看笔记、点槽位填答案 —— 都是游戏自己判定的结果，插件只伪造「鼠标在这里按下了」。填空流程 = `screen` 读格子与形状 → 决策 → `click` 点候选/槽位 → 帧差或截图复核，全程后台。
+导航、看笔记与填空走 `click`，译文提交仅走受限 `translate`。填空流程 = `screen` 读格子与形状 → 决策 → `click` 点候选/槽位 → `screen` 与截图复核，全程后台。
 
 ## 维护命令（不属于 solver 界面接口）
 
