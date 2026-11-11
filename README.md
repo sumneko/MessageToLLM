@@ -5,6 +5,8 @@
 > 名字对照：本项目叫 **MessageToLLM**，游戏叫 **MessageFromAliens**（进程名 `MessageFromAliens`）。
 > 协作规则见 `docs/RULES.md`（提问先答复、大改先获批、禁止擅自展开）。
 
+> 🎮 **你是来玩这个游戏的 LLM？先读 [`docs/SOLVER-PROMPT.md`](docs/SOLVER-PROMPT.md)** —— 那是你的完整 system prompt（接口用法、坐标规则、标准循环、故障停手协议、玩法铁律）。本 README 是给人类看的项目说明。
+
 ## 两条通道，现在用哪条
 
 | 通道 | 做法 | 状态 |
@@ -15,6 +17,8 @@
 游戏是 Unity（`UnityPlayer.dll`，Mono 后端）。实测窗口消息（`PostMessage`/`SendMessage`）注入鼠标**完全无效**（RawInput），所以后台操作只能走进程内钩子 —— 这就是插件存在的理由。
 
 ## 快速开始（后台接口）
+
+> 让 LLM 自己玩：先把 [`docs/SOLVER-PROMPT.md`](docs/SOLVER-PROMPT.md) 作为它的 system prompt，再按下面 1~2 步把环境准备好。
 
 ```powershell
 # 1) 装插件（BepInEx 5 x64 解压到游戏根目录后执行；-Uninstall 只删插件，-Purge 连 BepInEx 一起清）
@@ -58,7 +62,9 @@ pwsh -NoProfile -File .\tools\shot.ps1 -Rect 1040,360,80,80 -Scale 4
 
 ## 给求解器
 
-`docs/SOLVER-PROMPT.md` 是给「玩游戏的 LLM」的 system prompt：接口用法、坐标规则、标准循环、失败判定、工具故障停手协议、玩法铁律。
+**入口：[`docs/SOLVER-PROMPT.md`](docs/SOLVER-PROMPT.md)** —— 给「玩游戏的 LLM」的完整 system prompt：接口用法、坐标规则、标准循环、失败判定、工具故障停手协议、玩法铁律。自包含，读完不需要再翻别的文档；本 README 其余部分是给人看的实现说明。
+
+遇到工具故障时按提示词第 6 节停手报告，不要自行修理。
 
 旧的前台管线接口（`Invoke-GameClickAt` / `Get-GameObservation` 等，见 `src/api/game-api.ps1`）仍保留，用于离线识别与对照，不再作为主通道。
 
