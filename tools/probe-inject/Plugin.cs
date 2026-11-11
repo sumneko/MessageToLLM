@@ -181,6 +181,66 @@ namespace MtLProbe
                         return b.ToString();
                     }
 
+                // ---------- 维护命令（不属于 solver 界面接口，别让玩游戏的 LLM 用） ----------
+
+                case "resetprofile":
+                    {
+                        // resetprofile <n> —— 把第 n 号 profile 重置为空档
+                        if (arg == null) return "{\"ok\": false, \"error\": \"usage: resetprofile <n>\"}";
+                        int n = int.Parse(arg);
+
+                        string dir = Application.persistentDataPath;
+                        string file = Path.Combine(dir, "alienmessage" + n + ".sav");
+                        string bakDir = Path.Combine(OutDir, "backup");
+                        Directory.CreateDirectory(bakDir);
+                        long sizeBefore = -1;
+                        if (File.Exists(file))
+                        {
+                            sizeBefore = new FileInfo(file).Length;
+                            File.Copy(file, Path.Combine(bakDir, "alienmessage" + n + "." + DateTime.Now.ToString("HHmmss") + ".sav"), true);
+                        }
+
+                        object gd = GVStatic("globalData");
+                        SetField(gd, "slot", n);                 // 切到第 n 号
+                        CallStatic("LoadGame", true);   // 载入这个 profile
+
+                        object sd = GVStatic("savedata");
+                        int cleared = 0;
+                        string[] tables = { "dict", "flags", "dflags", "win", "solution", "bookmark", "notebook2" };
+                        foreach (string t in tables)
+                        {
+                            object c = GV(sd, t);
+                            IDictionary d = c as IDictionary;
+                            if (d != null) { d.Clear(); cleared++; continue; }
+                            IList l = c as IList;
+                            if (l != null) { l.Clear(); cleared++; }
+                        }
+
+                        CallStatic("SaveGame");
+
+                        long sizeAfter = File.Exists(file) ? new FileInfo(file).Length : -1;
+                        Log("RESETPROFILE " + n + "  before=" + sizeBefore + " after=" + sizeAfter + " cleared=" + cleared);
+                        return "{\"ok\": true, \"data\": {\"profile\": " + n + ", \"clearedTables\": " + cleared
+                            + ", \"sizeBefore\": " + sizeBefore + ", \"sizeAfter\": " + sizeAfter
+                            + ", \"file\": " + J(file) + "}}";
+                    }
+
+                case "savedata":
+                    {
+                        // 维护用：报告当前 profile 的存档规模（不读内容）
+                        object gd = GVStatic("globalData");
+                        object sd = GVStatic("savedata");
+                        StringBuilder b = new StringBuilder("{\"ok\": true, \"data\": {");
+                        b.Append("\"slot\": ").Append(GI(gd, "slot"));
+                        string[] tables = { "dict", "flags", "dflags", "win", "solution", "bookmark", "notebook2" };
+                        foreach (string t in tables)
+                        {
+                            b.Append(", ").Append(J(t)).Append(": ").Append(CountOf(GV(sd, t)));
+                        }
+                        b.Append("}}");
+                        return b.ToString();
+                    }
+
                 case "state":
                     Snapshot();
                     return "{\"ok\": true, \"data\": \"state.json refreshed\"}";
@@ -466,6 +526,28 @@ namespace MtLProbe
             IDictionary d = v as IDictionary;
             if (d != null) return d.Count;
             return -2;
+        }
+
+        static object GVStatic(string field)
+        {
+            FieldInfo f = typeof(Global).GetField(field, BF);
+            return f == null ? null : f.GetValue(null);
+        }
+
+        static void SetField(object obj, string field, object value)
+        {
+            if (obj == null) return;
+            FieldInfo f = obj.GetType().GetField(field, BF);
+            if (f != null) f.SetValue(obj, Convert.ChangeType(value, f.FieldType));
+        }
+
+        static object CallStatic(string method, params object[] args)
+        {
+            foreach (MethodInfo m in typeof(Global).GetMethods(BF))
+            {
+                if (m.Name == method && m.GetParameters().Length == args.Length) return m.Invoke(null, args);
+            }
+            throw new Exception("no static method " + method + "/" + args.Length + " on Global");
         }
 
         static string J(string s)

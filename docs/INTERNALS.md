@@ -178,6 +178,23 @@ click 1160 160 L  →  click 1080 400 L
 
 导航与操作全部走 `click`：点页签翻页、点符号看笔记、点槽位填答案 —— 都是游戏自己判定的结果，插件只伪造「鼠标在这里按下了」。填空流程 = `slots` 读格子与形状 → 决策 → `click` 点候选/槽位 → 帧差或截图复核，全程后台。
 
+## 维护命令（不属于 solver 界面接口）
+
+这两条**只给维护用**，玩游戏的 LLM 不得使用。
+
+| 命令 | 作用 |
+|---|---|
+| `savedata` | 只读：当前 profile 的 `slot` + 七张表规模（`dict/flags/dflags/win/solution/bookmark/notebook2`），不读内容 |
+| `resetprofile <n>` | 把第 n 号 profile 重置为空档：备份原档 → `globalData.slot = n` → `Global.LoadGame(true)` → 清空 `Global.savedata` 七张表 → `Global.SaveGame()` |
+
+实测（profile 7）：`alienmessage7.sav` 19136 → **152 字节**；重置后 `savedata` 为 `slot=7, dict=13, 其余全 0`（`dict=13` 是游戏启动时自灌的菜单词条，不是进度）。备份落在 `runs/inject/backup/`。
+
+坑：
+
+- 存档实际写入 **`persistentDataPath\76561198086961046\alienmessage<n>.sav`**（Steam AutoCloud 目录），不是 `persistentDataPath` 根目录 —— 根目录那几个 `.sav` 是旧的，删它们没用。
+- 只删文件没用：Steam 云会把它同步回来。要么在 Steam 关掉该游戏云同步，要么像 `resetprofile` 这样写一份空档覆盖，让云同步上传空档。
+- `Global.LoadGame` 之后内存里就是目标 profile，会影响当前这一局显示；恢复游玩前先确认 `savedata` 的 `slot` 对不对。
+
 ## 风险
 
 - 调错方法直接崩游戏（无存档），顺序必须是：只读打印 → 只读驱动 → 再写入
