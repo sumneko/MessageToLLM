@@ -27,6 +27,14 @@ namespace MtLProbe
         object _draw;
         string _cmdPath;
         string _resultPath;
+        List<RegionSnapshot> _lastScreenRegions;
+
+        sealed class RegionSnapshot
+        {
+            public int Id;
+            public string Signature;
+            public HashSet<string> Positions;
+        }
 
         // 合成点击的状态：临时改写 Unity 的输入查询，让游戏自己完成一次点击
         // 语义对齐 Unity 原生：按下的那一帧，GetMouseButtonDown 对所有调用者都返回 true
@@ -143,8 +151,11 @@ namespace MtLProbe
                 case "screen":
                     {
                         // 只给几何：几个区域、各自位置、区域内符号。区域是什么含义由 LLM 自己推。
-                        string body = BuildScreenData();
+                        List<RegionSnapshot> regions;
+                        string body = BuildScreenData(out regions);
                         if (body == null) return "{\"ok\": false, \"error\": \"draw not found\"}";
+                        string changes = CompareRegions(regions);
+                        body = body.Substring(0, body.Length - 1) + ", \"changes\": " + changes + "}";
                         return "{\"ok\": true, \"data\": " + body + "}";
                     }
 
@@ -283,19 +294,16 @@ namespace MtLProbe
             return new int[] { sx, sy, wpx, hpx };
         }
 
-        // 槽位对外表示：位置 + 尺寸 + 形状。不含 sector / 译文 / 任何语义。
-        static string SlotJson(int i, int j, int[] sp, string shapeId, float edge)
+        static string CellName(int x, int y, int rows)
         {
-            return "{\"x\": " + i + ", \"y\": " + j
-                + ", \"shapeId\": " + J(shapeId)
-                + ", \"edge\": " + edge.ToString("0.###")
-                + ", \"sp\": [" + sp[0] + ", " + sp[1] + ", " + sp[2] + ", " + sp[3] + "]}";
+            return "R" + (rows - y) + "C" + (x + 1);
         }
 
         // 整屏：按游戏自己的分区分组 → 「有几个区域 + 区域框 + 区域内符号」。
         // 区域代表什么，由 LLM 自己看符号推。
-        string BuildScreenData()
+        string BuildScreenData(out List<RegionSnapshot> regionSnapshots)
         {
+            regionSnapshots = new List<RegionSnapshot>();
             Resolve();
             if (_draw == null) return null;
 
@@ -305,10 +313,12 @@ namespace MtLProbe
             if (slots == null) { b.Append(", \"regions\": []}"); return b.ToString(); }
 
             int nx = slots.GetLength(0), ny = slots.GetLength(1);
+            int pitchX = Screen.width / nx, pitchY = Screen.height / ny;
             object[,] cell = new object[nx, ny];
             string[,] shapeIds = new string[nx, ny];
-            float[,] edges = new float[nx, ny];
             int[,][] box = new int[nx, ny][];
+            int[] symbolSize = null;
+            int[] firstCenter = null;
 
             // 先收集所有有 sprite 的格
             List<string> allShapes = new List<string>();
@@ -324,10 +334,29 @@ namespace MtLProbe
                     allShapes.Add(sid);
                     cell[i, j] = ac;
                     shapeIds[i, j] = sid;
-                    edges[i, j] = edge;
                     box[i, j] = ScreenRect(ac);
+                    if (symbolSize == null) symbolSize = new int[] { box[i, j][2], box[i, j][3] };
+                    if (firstCenter == null)
+                    {
+                        firstCenter = new int[] {
+                            box[i, j][0] + box[i, j][2] / 2 - i * pitchX,
+                            box[i, j][1] + box[i, j][3] / 2 - (ny - j - 1) * pitchY
+                        };
+                    }
                 }
             }
+
+            b.Append(", \"grid\": {\"rows\": ").Append(ny)
+             .Append(", \"cols\": ").Append(nx)
+             .Append(", \"firstCenter\": ");
+            if (firstCenter == null) b.Append("null");
+            else b.Append("[").Append(firstCenter[0]).Append(", ").Append(firstCenter[1]).Append("]");
+            b
+             .Append(", \"step\": [").Append(pitchX).Append(", ").Append(pitchY).Append("]")
+             .Append(", \"symbolSize\": ");
+            if (symbolSize == null) b.Append("null");
+            else b.Append("[").Append(symbolSize[0]).Append(", ").Append(symbolSize[1]).Append("]");
+            b.Append("}");
 
             // 空格判定：出现次数最多的形状，且占比 ≥ 40% —— 当作「空白底」，不参与分区。
             // 判定结果会写进输出的 blank 字段，LLM 能看到这次把谁当空了。
@@ -391,29 +420,151 @@ namespace MtLProbe
             for (int r = 0; r < comps.Count; r++)
             {
                 List<int[]> comp = comps[r];
-                int minX = int.MaxValue, minY = int.MaxValue, maxX = -1, maxY = -1;
                 StringBuilder items = new StringBuilder();
+                HashSet<string> regionPositions = new HashSet<string>();
+                Dictionary<string, List<int[]>> byShape = new Dictionary<string, List<int[]>>();
 
-                for (int k = 0; k < comp.Count; k++)
+                foreach (int[] rc in comp)
                 {
-                    int[] rc = comp[k];
-                    int[] sp = ScreenRect(cell[rc[0], rc[1]]);
-                    if (sp[0] < minX) minX = sp[0];
-                    if (sp[1] < minY) minY = sp[1];
-                    if (sp[0] + sp[2] > maxX) maxX = sp[0] + sp[2];
-                    if (sp[1] + sp[3] > maxY) maxY = sp[1] + sp[3];
-                    if (k > 0) items.Append(", ");
-                    items.Append(SlotJson(rc[0], rc[1], sp, shapeIds[rc[0], rc[1]], edges[rc[0], rc[1]]));
+                    string sid = shapeIds[rc[0], rc[1]];
+                    List<int[]> positions;
+                    if (!byShape.TryGetValue(sid, out positions))
+                    {
+                        positions = new List<int[]>();
+                        byShape.Add(sid, positions);
+                    }
+                    positions.Add(rc);
                 }
+
+                List<string> ids = new List<string>(byShape.Keys);
+                ids.Sort(StringComparer.Ordinal);
+                for (int k = 0; k < ids.Count; k++)
+                {
+                    if (k > 0) items.Append(", ");
+                    string sid = ids[k];
+                    List<int[]> positions = byShape[sid];
+                    positions.Sort(delegate (int[] a, int[] c)
+                    {
+                        int rowCmp = (ny - a[1]).CompareTo(ny - c[1]);
+                        return rowCmp != 0 ? rowCmp : a[0].CompareTo(c[0]);
+                    });
+                    items.Append("{\"shapeId\": ").Append(J(sid)).Append(", \"positions\": [");
+                    for (int p = 0; p < positions.Count; p++)
+                    {
+                        if (p > 0) items.Append(", ");
+                        string position = CellName(positions[p][0], positions[p][1], ny);
+                        regionPositions.Add(position);
+                        items.Append(J(position));
+                    }
+                    items.Append("]}");
+                }
+
+                regionSnapshots.Add(new RegionSnapshot {
+                    Id = r,
+                    Signature = items.ToString(),
+                    Positions = regionPositions
+                });
 
                 if (r > 0) b.Append(", ");
                 b.Append("{\"id\": ").Append(r)
                  .Append(", \"cells\": ").Append(comp.Count)
-                 .Append(", \"box\": [").Append(minX).Append(", ").Append(minY).Append(", ").Append(maxX - minX).Append(", ").Append(maxY - minY).Append("]")
                  .Append(", \"items\": [").Append(items).Append("]}");
             }
             b.Append("]}");
             return b.ToString();
+        }
+
+        string CompareRegions(List<RegionSnapshot> current)
+        {
+            bool hasBaseline = _lastScreenRegions != null;
+            List<RegionSnapshot> previous = _lastScreenRegions;
+            bool[] previousMatched = hasBaseline ? new bool[previous.Count] : new bool[0];
+            int[] previousForCurrent = new int[current.Count];
+            bool[] currentMatched = new bool[current.Count];
+            for (int i = 0; i < previousForCurrent.Length; i++) previousForCurrent[i] = -1;
+
+            if (hasBaseline)
+            {
+                // Exact matches survive region ID reordering.
+                for (int i = 0; i < current.Count; i++)
+                {
+                    for (int j = 0; j < previous.Count; j++)
+                    {
+                        if (!previousMatched[j] && current[i].Signature == previous[j].Signature)
+                        {
+                            previousForCurrent[i] = j;
+                            currentMatched[i] = true;
+                            previousMatched[j] = true;
+                            break;
+                        }
+                    }
+                }
+
+                // Match changed regions by overlapping grid positions.
+                while (true)
+                {
+                    int bestOverlap = 0, bestCurrent = -1, bestPrevious = -1;
+                    for (int i = 0; i < current.Count; i++)
+                    {
+                        if (currentMatched[i]) continue;
+                        for (int j = 0; j < previous.Count; j++)
+                        {
+                            if (previousMatched[j]) continue;
+                            int overlap = 0;
+                            foreach (string position in current[i].Positions)
+                            {
+                                if (previous[j].Positions.Contains(position)) overlap++;
+                            }
+                            if (overlap > bestOverlap)
+                            {
+                                bestOverlap = overlap;
+                                bestCurrent = i;
+                                bestPrevious = j;
+                            }
+                        }
+                    }
+                    if (bestOverlap == 0) break;
+                    previousForCurrent[bestCurrent] = bestPrevious;
+                    currentMatched[bestCurrent] = true;
+                    previousMatched[bestPrevious] = true;
+                }
+            }
+
+            StringBuilder added = new StringBuilder();
+            StringBuilder changed = new StringBuilder();
+            StringBuilder removed = new StringBuilder();
+            for (int i = 0; i < current.Count; i++)
+            {
+                if (previousForCurrent[i] < 0)
+                {
+                    if (hasBaseline)
+                    {
+                        if (added.Length > 0) added.Append(", ");
+                        added.Append(current[i].Id);
+                    }
+                }
+                else if (current[i].Signature != previous[previousForCurrent[i]].Signature)
+                {
+                    if (changed.Length > 0) changed.Append(", ");
+                    changed.Append("{\"id\": ").Append(current[i].Id)
+                           .Append(", \"previousId\": ").Append(previous[previousForCurrent[i]].Id).Append("}");
+                }
+            }
+            if (hasBaseline)
+            {
+                for (int j = 0; j < previous.Count; j++)
+                {
+                    if (previousMatched[j]) continue;
+                    if (removed.Length > 0) removed.Append(", ");
+                    removed.Append(previous[j].Id);
+                }
+            }
+
+            _lastScreenRegions = current;
+            return "{\"baseline\": " + (hasBaseline ? "true" : "false")
+                + ", \"addedRegions\": [" + added + "]"
+                + ", \"changedRegions\": [" + changed + "]"
+                + ", \"removedRegions\": [" + removed + "]}";
         }
 
         static readonly Dictionary<string, string> _shapeCache = new Dictionary<string, string>();
@@ -531,7 +682,8 @@ namespace MtLProbe
         {
             StringBuilder sb = new StringBuilder();
             sb.Append("{\n  \"time\": \"").Append(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")).Append("\",\n  \"data\": ");
-            string body = BuildScreenData();
+            List<RegionSnapshot> ignored;
+            string body = BuildScreenData(out ignored);
             sb.Append(body == null ? "null" : body);
             sb.Append("\n}\n");
             File.WriteAllText(Path.Combine(OutDir, "state.json"), sb.ToString(), Encoding.UTF8);

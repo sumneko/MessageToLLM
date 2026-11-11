@@ -51,12 +51,13 @@ pwsh -NoProfile -File .\tools\shot.ps1 -Rect 1040,360,80,80 -Scale 4
 
 | 命令 | 说明 |
 |---|---|
-| `screen` | 整屏快照：`screen`（尺寸）、`blank`（本次判定的空白色）、`regions[]` |
+| `screen` | 整屏快照：屏幕尺寸、共享网格参数、`blank`、`regions[]` 和与上次显式 `screen` 比较的 `changes` |
 | `click <x> <y> [L\|R]` | 在屏幕坐标点一下，交给游戏自己的点击逻辑 |
 | `state` | 立刻重写 `runs\inject\state.json`（后台每 1s 自动写，内容同 `screen`） |
 
-`regions[]` 每项：`id`（不透明序号 `r0/r1/...`）、`cells`、`box`（区域框）、`items[]`。
-`items[]` 每项：`x` `y`（网格号）、`shapeId`（形状指纹，同形同 ID、不含词义）、`edge`、`sp`（格子矩形）。
+`grid` 提供行列数、左上格中心、横纵格距和统一符号尺寸。行列从左上角起、从 1 编号；`R3C5` 中心坐标按 `firstCenter + [(列-1)*横向步长, (行-1)*纵向步长]` 计算。
+`regions[]` 每项包含区域编号、格数及 `items[]`。`items[]` 按 `shapeId` 去重，每项含该形状在区域内出现的 `positions`（如 `R1C2`）；同一形状在同一区域出现多次时只发送一次指纹。
+`changes` 报告新增、变化、消失的区域；第一次 `screen` 只建立基线。后台 `state.json` 快照不会推进基线。
 
 维护命令（**不属于** solver 接口）：`savedata`（看当前 profile 存档规模）、`resetprofile <n>`（重置某号 profile）。
 
