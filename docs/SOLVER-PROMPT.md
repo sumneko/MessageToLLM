@@ -47,15 +47,15 @@ pwsh -NoProfile -File .\tools\shot.ps1 -Rect <sx,sy,w,h> [-Scale 4]
 | `state`  | 立刻重写 `runs\inject\state.json`（后台每 1s 也会自动写）                                                                       |
 
 - **`shapeId`** 是形状指纹（`s` + 8 位十六进制）。**同形同 ID、异形异 ID、不含任何词义**。它就是你要用的符号唯一 ID，跨页、跨会话都稳定。
-- `grid` 含 `rows`、`cols`、`firstCenter`（左上格中心的截图坐标）、`step`（横纵格距）和 `symbolSize`（统一符号宽高）。
+- `screen` 返回的 `data.screen` 是当前画面宽高 `[width, height]`，`data.grid` 含 `rows`、`cols`、`firstCenter`（左上格中心的截图坐标）、`step`（横纵格距）和 `symbolSize`（统一符号宽高）。
 - `regions[]` 只包含当前激活且实际可见的符号；隐藏 GameObject、禁用/透明 Renderer 或相机不可见的对象会被过滤。`selection.framedPositions` 列出当前被闭合方框围住的 R/C 格，`selection.frames` 另含对应像素框；检测不依赖颜色，开放线段不会算作框。
 - `selection.highlights` 是符号背景高亮，格式 `[{shapeId, positions}]`：只列该实例背景真被画出来的位置，没有高亮时返回空数组。它**不是**闭合框，也不能假定同一 `shapeId` 的全部位置都亮（同形可能只有部分实例高亮）；判断"哪些格带底色"只看这个字段。
 - `selection.underlinedPositions` 是带下划线的字符位置（行优先的 `RrCc` 列表），`selection.underlines` 另给 `[{position, points: [[x,y],[x,y]]}]` 的线段端点。它来自 `Draw.selected` 的开放水平短线，与闭合框、背景高亮、置灰互不混算：要判断下划线是否移动，只看这两个字段。
 - `selection.dimmed` 是置灰字符，格式与 `highlights` 相同 `[{shapeId, positions}]`：只列该实例颜色确实等于游戏自己算的灰色（`DefaultColor(3)`）的位置，全屏没有置灰时返回空数组。不要假定同一 `shapeId` 的全部位置都灰；"哪些格是灰的"只看这个字段，不要拿截图像素自己判色。
-- 行列号从左上角开始、从 1 起算。`RrCc` 的中心坐标为 `x = firstCenter[0] + (c - 1) * step[0]`、`y = firstCenter[1] + (r - 1) * step[1]`。
+- 行列号从左上角开始、从 1 起算。`RrCc` 的 `r` 是行、`c` 是列，中心坐标为 `x = grid.firstCenter[0] + (c - 1) * grid.step[0]`、`y = grid.firstCenter[1] + (r - 1) * grid.step[1]`。使用本次 `screen` 返回的参数，不要按 1080p 换算或自行缩放；`firstCenter` 为 `null` 时不能计算坐标。
 - 每个区域的 `items[]` 按指纹去重：每项含 `{shapeId, positions}`，`positions` 是该形状在区域内出现的 `RrCc` 列表；有已填译文时还会含 `translation`。相同 shapeId 可能在同一区域出现多次，只会在该区域列出一次。
 - `translation` 只在输入框有非空内容且内容不等于单独的 `?` 时返回。若同形位置有不同译文，回包会带 `translationConflict:true`；不要把冲突值当成定论。
-- 要看某个位置的形状，先用 R/C 公式算中心，再以 `symbolSize` 为宽高计算左上角：`sx = x - symbolSize[0]/2`、`sy = y - symbolSize[1]/2`，调用 `shot.ps1 -Rect sx,sy,w,h`。
+- 要看某个位置的形状，先用 R/C 公式算中心，再以 `symbolSize` 为宽高计算左上角：`sx = x - symbolSize[0]/2`、`sy = y - symbolSize[1]/2`，将坐标取整后调用 `shot.ps1 -Rect sx,sy,w,h`；`symbolSize` 为 `null` 时不能计算裁剪框。
 - `changes` 包含 `baseline`、`addedRegions`、`changedRegions`、`removedRegions`。首次 `screen` 为 `baseline:false` 且列表为空；之后列出新增区域 ID、变化区域 `{id, previousId}`、消失区域的上次 ID。符号高亮位置、下划线位置或置灰位置变动也会标记其区域变化——包括只有背景亮/灭、只有下划线挪位、只有一个字变灰、符号与译文都没变的情况。未变化区域可能因排序改变而换 ID，比较会尽量沿用其内容匹配，不要把 ID 单独当成区域身份。
 - `changes` 不负责追踪框位置；要判断框是否移动，比较相邻两次 `screen` 的 `selection.framedPositions`，要判断高亮是否改变，比较相邻两次的 `selection.highlights`，下划线看 `selection.underlinedPositions`，置灰看 `selection.dimmed`。
 - 只有显式 `screen` 会更新差异基线；`state` 与后台自动快照不会更新。若最近一次 `screen` 的 `baseline` 为 `false`，在点击前再运行一次 `screen` 建立基线。
@@ -80,7 +80,7 @@ pwsh -NoProfile -File .\tools\shot.ps1 -Rect <sx,sy,w,h> [-Scale 4]
 2. **只点格子中心**：从 `RrCc` 用 `grid.firstCenter` 与 `grid.step` 换算。点格子边缘或空格通常毫无反应。
 3. 点完等 **300–800ms** 再观察。
 4. 同一位置不要连点。没反应先换假设（换点、换页、换键），**同一动作最多试 2 次**。
-5. 不要点屏幕外坐标（`x` 0–1919、`y` 0–1079）。
+5. 不要点屏幕外坐标：以本次 `data.screen` 为准，`0 <= x < width`、`0 <= y < height`。分辨率变化后重新读取 `screen`，不要沿用旧坐标。
 
 ## 三、标准循环（每一步都要走完）
 
@@ -214,7 +214,7 @@ click <候选格中心> L   →   click <答案框中心> L
 - 游戏在后台运行并 tick；**不要**为了让游戏「动起来」去切前台或移动真实鼠标。
 - 命令通过 `runs\inject\cmd.txt` → `runs\inject\result.json` 交互，一次只容许一条在途命令。
 - 区域数量与区域框会随画面变化，这是正常现象，不是错误。
-- 分辨率/DPI/缩放都已由工具处理；坐标使用 `grid` 参数与 R/C 公式换算。
+- 坐标使用当前 `screen` 返回的实际画面尺寸、`grid` 参数与 R/C 公式换算，不要假设固定分辨率。
 
 ## 九、记录
 

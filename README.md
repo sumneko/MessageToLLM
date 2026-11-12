@@ -8,10 +8,10 @@
 
 ## 两条通道，现在用哪条
 
-| 通道 | 做法 | 状态 |
-|---|---|---|
-| **后台界面接口**（现用） | BepInEx 插件 + 命令文件，进程内读屏、伪造鼠标点击 | ✅ 可用，不需要前台、不抢鼠标 |
-| 前台截屏 + 点击（旧管线） | `src/**` PowerShell 管线：截屏 → 切块 → 指纹 → `mouse_event` 点击 | ✅ 仍能跑，但**必须抢前台**；保留作对照与工具 |
+| 通道                           | 做法                                                                     | 状态                                                |
+| ------------------------------ | ------------------------------------------------------------------------ | --------------------------------------------------- |
+| **后台界面接口**（现用） | BepInEx 插件 + 命令文件，进程内读屏、伪造鼠标点击                        | ✅ 可用，不需要前台、不抢鼠标                       |
+| 前台截屏 + 点击（旧管线）      | `src/**` PowerShell 管线：截屏 → 切块 → 指纹 → `mouse_event` 点击 | ✅ 仍能跑，但**必须抢前台**；保留作对照与工具 |
 
 游戏是 Unity（`UnityPlayer.dll`，Mono 后端）。实测窗口消息（`PostMessage`/`SendMessage`）注入鼠标**完全无效**（RawInput），所以后台操作只能走进程内钩子 —— 这就是插件存在的理由。
 
@@ -40,21 +40,21 @@ pwsh -NoProfile -File .\tools\shot.ps1 -Rect 1040,360,80,80 -Scale 4
 
 ## 游戏进程控制 API
 
-| 命令 | 说明 |
-|---|---|
-| `pwsh -NoProfile -File .\tools\game-control.ps1 status` | 输出 `closed`、`running`、`minimized` 或 `not-foreground` |
-| `pwsh -NoProfile -File .\tools\game-control.ps1 start` | 启动安装目录中的游戏 EXE；若 EXE 不存在则回退 Steam URI，进程已存在时不重复启动 |
+| 命令                                                      | 说明                                                                            |
+| --------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| `pwsh -NoProfile -File .\tools\game-control.ps1 status` | 输出 `closed`、`running`、`minimized` 或 `not-foreground`               |
+| `pwsh -NoProfile -File .\tools\game-control.ps1 start`  | 启动安装目录中的游戏 EXE；若 EXE 不存在则回退 Steam URI，进程已存在时不重复启动 |
 
 命令返回 JSON；默认游戏目录为 `D:\steam\steamapps\common\Message From Aliens`，可用 `-GameDir` 覆盖；启动默认最多等待 150 秒，可用 `-TimeoutSec` 调整。
 
 ## 后台界面接口
 
-| 命令 | 说明 |
-|---|---|
-| `screen` | 整屏快照：屏幕尺寸、共享网格参数、`blank`、`regions[]` 和与上次显式 `screen` 比较的 `changes` |
-| `click <x> <y> [L\|R]` | 在屏幕坐标点一下，交给游戏自己的点击逻辑 |
-| `translate <shapeId> <text>` | 对当前画面中匹配的符号提交译文 |
-| `state` | 立刻重写 `runs\inject\state.json`（后台每 1s 自动写，内容同 `screen`） |
+| 命令                           | 说明                                                                                                  |
+| ------------------------------ | ----------------------------------------------------------------------------------------------------- |
+| `screen`                     | 整屏快照：屏幕尺寸、共享网格参数、`blank`、`regions[]` 和与上次显式 `screen` 比较的 `changes` |
+| `click <x> <y> [L\|R]`        | 在屏幕坐标点一下，交给游戏自己的点击逻辑                                                              |
+| `translate <shapeId> <text>` | 对当前画面中匹配的符号提交译文                                                                        |
+| `state`                      | 立刻重写 `runs\inject\state.json`（后台每 1s 自动写，内容同 `screen`）                            |
 
 `grid` 提供行列数、左上格中心、横纵格距和统一符号尺寸。行列从左上角起、从 1 编号；`R3C5` 中心坐标按 `firstCenter + [(列-1)*横向步长, (行-1)*纵向步长]` 计算。
 `regions[]` 每项包含区域编号、格数及 `items[]`。`items[]` 按 `shapeId` 去重，每项含该形状在区域内出现的 `positions`（如 `R1C2`）；当前闭合方框的位置由顶层 `selection.framedPositions` 返回，`selection.frames` 附像素矩形。有已填译文时附 `translation`，空白或单独 `?` 不返回。同一形状在同一区域出现多次时只发送一次指纹。
