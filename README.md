@@ -15,6 +15,21 @@
 
 游戏是 Unity（`UnityPlayer.dll`，Mono 后端）。实测窗口消息（`PostMessage`/`SendMessage`）注入鼠标**完全无效**（RawInput），所以后台操作只能走进程内钩子 —— 这就是插件存在的理由。
 
+## 首次安装环境
+
+1. 在 Windows 上安装 [PowerShell 7](https://learn.microsoft.com/powershell/scripting/install/installing-powershell-on-windows) 和 Steam 版 *Message From Aliens*。
+2. 下载 [BepInEx 5 x64](https://github.com/BepInEx/BepInEx/releases/tag/v5.4.23.3) 的 `BepInEx_win_x64_5.4.23.3.zip`，解压到游戏根目录，使 `BepInEx\core\BepInEx.dll` 位于游戏目录下。
+3. 退出游戏，在仓库根目录运行 `pwsh -NoProfile -File .\tools\build-probe.ps1`，编译并安装插件。脚本使用 Windows 自带的 .NET Framework 64 位 C# 编译器 `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe`，若该文件不存在，需先安装 .NET Framework。
+
+脚本默认游戏目录为 `D:\steam\steamapps\common\Message From Aliens`。如果实际安装位置不同，安装插件和启动游戏时传入 `-GameDir`，例如：
+
+```powershell
+pwsh -NoProfile -File .\tools\build-probe.ps1 -GameDir 'D:\SteamLibrary\steamapps\common\Message From Aliens'
+pwsh -NoProfile -File .\tools\game-control.ps1 start -GameDir 'D:\SteamLibrary\steamapps\common\Message From Aliens'
+```
+
+首次安装完成后，按下方步骤启动游戏并使用后台接口。
+
 ## 快速开始（后台接口）
 
 按下面步骤准备后台接口：
